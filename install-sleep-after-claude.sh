@@ -665,6 +665,29 @@ else
   MAGENTA=""
 fi
 
+# Numeric environment overrides are user input that reaches arithmetic
+# contexts. Under `set -u` a non-numeric value there is not a harmless
+# fallback: bash reads the word as a variable name, finds it unset, and
+# aborts. On the watch path that ends the run, so one typo in a tuning
+# knob would take the whole night with it.
+#
+# Validate at assignment; fall back loudly.
+SAC_CONFIG_WARNINGS=""
+# Answers in $REPLY rather than on stdout. Command substitution would
+# run this in a subshell, so the warning it accumulates would die with
+# that subshell and a bad value would be corrected in silence — the
+# fallback would work and the user would never learn their knob was
+# ignored.
+_cfg_int() {
+  local name="$1" value="$2" fallback="$3"
+  if [[ "$value" =~ ^[0-9]+$ ]] && ((10#$value > 0)); then
+    REPLY=$((10#$value))
+    return
+  fi
+  SAC_CONFIG_WARNINGS+="${name}=\"${value}\" is not a positive integer — using ${fallback}"$'\n'
+  REPLY="$fallback"
+}
+
 # ── Config defaults ───────────────────────────────────────────
 TIMEOUT_HOURS=6
 DELAY_SECS=1
@@ -743,7 +766,8 @@ fi
 # Default 5 minutes: long enough that a brief gap between turns (or a
 # slow tool call that outlives its transcript write) doesn't trip the
 # countdown, short enough to be useful as a nightly command.
-SMART_IDLE_SECONDS="${SAC_IDLE_SECONDS:-300}"
+_cfg_int SAC_IDLE_SECONDS "${SAC_IDLE_SECONDS:-300}" 300
+SMART_IDLE_SECONDS="$REPLY"
 
 # A busy marker whose session transcript hasn't been written for this
 # many minutes is treated as dead weight — a crashed session, a session
@@ -754,7 +778,8 @@ SMART_IDLE_SECONDS="${SAC_IDLE_SECONDS:-300}"
 # activity (rather than the marker's own mtime alone) this can be far
 # tighter than the old blind 24h reaper without risking a reap
 # mid-work. Override with SAC_STALE_MARKER_MINUTES.
-SMART_STALE_MARKER_MINS="${SAC_STALE_MARKER_MINUTES:-15}"
+_cfg_int SAC_STALE_MARKER_MINUTES "${SAC_STALE_MARKER_MINUTES:-15}" 15
+SMART_STALE_MARKER_MINS="$REPLY"
 
 # Sentinel embedded in every hook command goodnight installs. Unlike a
 # sibling JSON key (._managed_by), a substring of the command string
@@ -767,9 +792,30 @@ HOOK_SENTINEL="goodnight-hook"
 # Verified-sleep tuning. pmset returns 0 even when an assertion blocks
 # the sleep, so a single call proves nothing; we confirm afterwards and
 # retry. See attempt_sleep().
-SLEEP_MAX_ATTEMPTS="${SAC_SLEEP_MAX_ATTEMPTS:-3}"
-SLEEP_VERIFY_SECS="${SAC_SLEEP_VERIFY_SECS:-12}"
-SLEEP_RETRY_BACKOFF_SECS="${SAC_SLEEP_RETRY_BACKOFF_SECS:-5}"
+_cfg_int SAC_SLEEP_MAX_ATTEMPTS "${SAC_SLEEP_MAX_ATTEMPTS:-3}" 3
+SLEEP_MAX_ATTEMPTS="$REPLY"
+_cfg_int SAC_SLEEP_VERIFY_SECS "${SAC_SLEEP_VERIFY_SECS:-12}" 12
+SLEEP_VERIFY_SECS="$REPLY"
+_cfg_int SAC_SLEEP_RETRY_BACKOFF_SECS "${SAC_SLEEP_RETRY_BACKOFF_SECS:-5}" 5
+SLEEP_RETRY_BACKOFF_SECS="$REPLY"
+
+# A running agent that is burning CPU is working, whatever its session
+# log says. This closes the one gap the log-mtime signal cannot cover:
+# an agent with no busy marker — Codex — running a long tool call that
+# writes nothing while it runs.
+#
+# Expressed as percent of one core, sampled as a delta over the poll
+# interval so it is scale-invariant and immune to a process's lifetime
+# total. Measured idle floor for live agent processes on a working
+# machine is ~5%, so 20% carries roughly a 4x margin.
+#
+# This can only ever DELAY sleep, never authorise it: an agent blocked
+# on a network round trip burns no CPU while genuinely working, so CPU
+# is sound as a veto and useless as permission. The hard --timeout
+# bounds the veto so it can never wedge the watch.
+_cfg_int SAC_AGENT_CPU_BUSY_PCT "${SAC_AGENT_CPU_BUSY_PCT:-20}" 20
+AGENT_CPU_BUSY_PCT="$REPLY"
+CPU_GUARD=true
 
 UNATTENDED=false
 NO_REPAIR=false
@@ -777,10 +823,12 @@ DOCTOR_MODE=false
 # Seconds an interactive prompt may block before it self-answers with
 # the safe default. Guarantees an unattended `goodnight` can never hang
 # on a question nobody is awake to answer.
-PROMPT_TIMEOUT_SECS="${SAC_PROMPT_TIMEOUT_SECS:-60}"
+_cfg_int SAC_PROMPT_TIMEOUT_SECS "${SAC_PROMPT_TIMEOUT_SECS:-60}" 60
+PROMPT_TIMEOUT_SECS="$REPLY"
 # Rotate the log once it passes this size so an unattended nightly
 # command can't grow it without bound.
-LOG_MAX_BYTES="${SAC_LOG_MAX_BYTES:-2097152}"
+_cfg_int SAC_LOG_MAX_BYTES "${SAC_LOG_MAX_BYTES:-2097152}" 2097152
+LOG_MAX_BYTES="$REPLY"
 UPDATE_CHECK_URL="${SLEEP_AFTER_CLAUDE_UPDATE_URL:-https://raw.githubusercontent.com/sambatia/sleep-after-claude/main/sleep-after-claude}"
 UPDATE_INSTALLER_URL="${SLEEP_AFTER_CLAUDE_INSTALLER_URL:-https://raw.githubusercontent.com/sambatia/sleep-after-claude/main/install-sleep-after-claude.sh}"
 UPDATE_CACHE_DIR="${HOME}/.cache/sleep-after-claude"
@@ -1180,6 +1228,7 @@ Run `--doctor` to see all of this as live state.
 | `--no-preflight` | Skip pre-flight scan entirely. |
 | `--force, -f` | Skip confirmation prompts. |
 | `--no-repair` | Don't auto-repair degraded Claude Code hooks. |
+| `--no-cpu-guard` | Don't treat agent CPU activity as a reason to stay awake. |
 | `--check-update` | Check for a newer version now (off by default). |
 | `--skip-update-check` | Accepted for compatibility; the check is already off. |
 | `--no-auto-caffeinate` | Don't auto-start `caffeinate -dim` if missing. |
@@ -2590,6 +2639,46 @@ newest_agent_activity() {
   } | sort -rn | head -1
 }
 
+# Total CPU time consumed by every live agent process, in centiseconds.
+# Echoes 0 when none are running or the figures cannot be read, so a
+# failure here degrades to "no veto" rather than to a stuck watch.
+agent_cpu_centiseconds() {
+  local pids csv
+  pids="$({
+    pgrep -x claude
+    pgrep -x codex
+  } 2>/dev/null | sort -u)"
+  [[ -n "$pids" ]] || {
+    echo 0
+    return
+  }
+  csv="$(printf '%s' "$pids" | tr '\n' ',' | sed 's/,$//')"
+  # macOS renders cumulative CPU as [dd-][hh:]mm:ss.ss, so parse from
+  # the right rather than assuming a field count.
+  # Captured and validated at a single exit point. The obvious
+  # `... | awk ... || echo 0` is wrong under `set -o pipefail`: awk's
+  # END block still prints its 0 when ps fails, and the failing pipeline
+  # then fires the fallback as well, emitting "0\n0" and breaking this
+  # function's one-number contract.
+  local out
+  out="$(
+    ps -p "$csv" -o time= 2>/dev/null | awk '
+      {
+        t = $1; d = 0
+        if (index(t, "-")) { split(t, a, "-"); d = a[1]; t = a[2] }
+        n = split(t, f, ":"); s = 0
+        if (n == 3)      s = f[1] * 3600 + f[2] * 60 + f[3]
+        else if (n == 2) s = f[1] * 60 + f[2]
+        else             s = f[1]
+        total += d * 86400 + s
+      }
+      END { printf "%d\n", total * 100 }
+    ' 2>/dev/null
+  )" || out=""
+  [[ "$out" =~ ^[0-9]+$ ]] || out=0
+  printf '%s\n' "$out"
+}
+
 # Delete busy markers that no longer represent live work:
 #   - session transcript missing entirely (session id we can't verify,
 #     and the marker itself is older than the stale window)
@@ -2819,6 +2908,8 @@ uninstall_claude_hooks() {
 #   2  hard timeout reached (caller sleeps anyway)
 smart_watch_loop() {
   local now busy recent_write activity_ts last_activity
+  local cpu_now cpu_delta cpu_window cpu_busy
+  local prev_cpu=-1 prev_cpu_ts=0
   local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
   local tick=0 poll
   local start_ts elapsed idle_for remaining
@@ -2882,6 +2973,24 @@ smart_watch_loop() {
         last_activity=$activity_ts
       fi
     fi
+    # Third signal: an agent burning CPU is working even if it has
+    # written nothing. Delta over the interval actually elapsed, so the
+    # threshold means the same thing whichever poll rate is in force.
+    cpu_busy=false
+    if [[ "$CPU_GUARD" == true ]]; then
+      cpu_now="$(agent_cpu_centiseconds)"
+      if ((prev_cpu >= 0)) && [[ "$cpu_now" =~ ^[0-9]+$ ]]; then
+        cpu_window=$((now - prev_cpu_ts))
+        ((cpu_window < 1)) && cpu_window=1
+        cpu_delta=$((cpu_now - prev_cpu))
+        if ((cpu_delta > cpu_window * AGENT_CPU_BUSY_PCT)); then
+          cpu_busy=true
+          last_activity=$now
+        fi
+      fi
+      [[ "$cpu_now" =~ ^[0-9]+$ ]] && prev_cpu=$cpu_now && prev_cpu_ts=$now
+    fi
+
     idle_for=$((now - last_activity))
     ((idle_for < 0)) && idle_for=0
     # Only used for the non-TTY status line, to name which of the two
@@ -2921,6 +3030,8 @@ smart_watch_loop() {
         local why
         if [[ "$busy" != "0" ]]; then
           why="${busy} session(s) working"
+        elif [[ "$cpu_busy" == true ]]; then
+          why="an agent is busy on CPU"
         else
           why="agent output still being written"
         fi
@@ -2930,7 +3041,7 @@ smart_watch_loop() {
           "$(elapsed_label "$elapsed")"
       elif ((now - last_log >= 300)); then
         last_log=$now
-        echo "  … still waiting (busy=$busy recent_output=$recent_write, $(elapsed_label "$elapsed") elapsed)"
+        echo "  … still waiting (busy=$busy recent_output=$recent_write cpu_busy=$cpu_busy, $(elapsed_label "$elapsed") elapsed)"
       fi
       # Nothing is imminent, so poll lazily. At 5s this is ~700 wakeups
       # over an eight-hour night instead of ~14,000.
@@ -3105,6 +3216,13 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-repair)
       NO_REPAIR=true
+      shift
+      ;;
+    --no-cpu-guard)
+      # Stop treating agent CPU burn as activity. Only reason to want
+      # this is an agent process that idles hot enough to trip the
+      # threshold and hold the watch open.
+      CPU_GUARD=false
       shift
       ;;
     --no-log)
@@ -3353,6 +3471,20 @@ if [[ "$DOCTOR_MODE" == true ]]; then
     else
       print_ok "No agent output in the last $(elapsed_label "$SMART_IDLE_SECONDS")."
     fi
+    # The watch stats every one of these on each idle tick and nothing
+    # prunes them, so the cost grows quietly for as long as the machine
+    # is used. Surfacing the count keeps that visible rather than
+    # letting it creep.
+    dr_logs=0
+    for dr_dir in "${AGENT_ACTIVITY_DIRS[@]}"; do
+      [[ -d "$dr_dir" ]] || continue
+      dr_logs=$((dr_logs + $(find "$dr_dir" -name '*.jsonl' 2>/dev/null | wc -l | tr -d ' ')))
+    done
+    ui_kv "Session logs" "${dr_logs} scanned per idle tick"
+  fi
+  dr_cpu="$(agent_cpu_centiseconds)"
+  if [[ "$dr_cpu" =~ ^[0-9]+$ ]]; then
+    ui_kv "Agent CPU guard" "$([[ "$CPU_GUARD" == true ]] && echo "on, busy above ${AGENT_CPU_BUSY_PCT}% of one core" || echo "off")"
   fi
 
   ui_section "Watch configuration"
@@ -3482,12 +3614,18 @@ if [[ "$LOG_SUMMARY" == true ]]; then
     echo ""
     echo "| Category | Count |"
     echo "|---|---|"
-    for pat in WATCH_START CLAUDE_FINISHED SLEEP_ATTEMPT SLEEP_FAILED PREFLIGHT_BLOCKERS PREFLIGHT_SCAN_FAILED POWER_GATE_WAITING POWER_GATE_RELEASED AUTO_CAFFEINATE_STARTED CANCELLED TIMEOUT PID_REUSED; do
-      # grep -c always prints a count to stdout (even "0" when no match)
-      # and exits 1 on no-match — we only care about stdout here.
-      c="$(grep -c "$pat" "$LOG_FILE" 2>/dev/null)"
-      echo "| $pat | ${c:-0} |"
-    done
+    # Derived from the log itself rather than a hand-kept list.
+    # A parallel vocabulary drifts the moment an event is added or
+    # renamed, and it had: every event the current code emits was
+    # reporting zero. Counting what is actually there cannot drift.
+    awk '{
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^[A-Z][A-Z0-9_]{3,}$/) { print $i; break }
+      }
+    }' "$LOG_FILE" | sort | uniq -c | sort -rn |
+      while read -r count event; do
+        echo "| $event | $count |"
+      done
   } | {
     ui_markdown
   }
@@ -3499,6 +3637,11 @@ fi
 # burn battery downloading updates or waiting for Claude when the
 # machine is unplugged. Desktop Macs (no battery) pass through.
 print_header
+if [[ -n "$SAC_CONFIG_WARNINGS" ]]; then
+  while IFS= read -r _cfg_warn; do
+    [[ -n "$_cfg_warn" ]] && print_warn "$_cfg_warn"
+  done <<<"$SAC_CONFIG_WARNINGS"
+fi
 wait_for_ac_power
 
 # ── Self-update check ─────────────────────────────────────────
@@ -3861,6 +4004,10 @@ if [[ "${SMART_WATCH_DONE:-false}" != true ]]; then
   # ── Wait loop ─────────────────────────────────────────────────
   WATCH_STARTED=true
   START_TIME=$(date +%s)
+  # Same suspension guard as smart mode. This path measures its deadline
+  # against the wall clock too, so without it a lid closed mid-watch
+  # reads as elapsed watch time and the timeout fires on wake.
+  PID_ENTRY_SLEEP_STAMP="$(sleep_stamp)"
   FRAMES=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
   TICK=0
   TICK_COUNT=0
@@ -3886,6 +4033,24 @@ if [[ "${SMART_WATCH_DONE:-false}" != true ]]; then
         log_event "PID_REUSED pid=$TARGET_PID was=\"$TARGET_CMD_FULL\" now=\"$CURRENT_CMD\""
         PID_REUSED=true
         break
+      fi
+    fi
+
+    # Checked on the same cadence as ELAPSED and *before* the timeout
+    # branch below. On a rarer cadence the two could cross: wake from a
+    # suspension that outlasted --timeout on a tick that skips this
+    # check, and the timeout fires first — putting the Mac back to
+    # sleep in the user's hands, which is the exact failure this guard
+    # exists to prevent.
+    if [[ -n "$PID_ENTRY_SLEEP_STAMP" ]] && ((TICK_COUNT % 10 == 0)); then
+      NOW_SLEEP_STAMP="$(sleep_stamp)"
+      if [[ -n "$NOW_SLEEP_STAMP" && "$NOW_SLEEP_STAMP" != "$PID_ENTRY_SLEEP_STAMP" ]]; then
+        clear_line
+        print_ok "The Mac slept while goodnight was watching — nothing left to do."
+        log_event "SLEPT_EXTERNALLY (watch-pid) after=${ELAPSED}s"
+        notify_macos "Mac already slept — goodnight stood down"
+        print_done "Nothing to do — the Mac slept on its own."
+        exit 0
       fi
     fi
 
