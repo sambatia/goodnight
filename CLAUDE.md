@@ -20,7 +20,7 @@ macOS Bash utility `sleep-after-claude` (aliased to `goodnight`) that watches a 
 - `scripts/check-parity.sh` — verifies the embedded payload matches the standalone script. See "Parity invariant" below.
 - `.githooks/pre-commit` — opt-in legacy hook that runs the parity check when either script is staged. Enable with `git config core.hooksPath .githooks`. Superseded by the `pre-commit` framework config at `.pre-commit-config.yaml`.
 - `.pre-commit-config.yaml` — canonical pre-commit config. Runs parity + `shellcheck` + `shfmt` + repo hygiene on every commit.
-- `tests/` — bats-core regression suite (213 tests). Each `*.bats` file's header comment names the audit finding(s) or subsystem it protects. Live counts: `bats tests/ --count` and `ls tests/*.bats | wc -l`.
+- `tests/` — bats-core regression suite (218 tests). Each `*.bats` file's header comment names the audit finding(s) or subsystem it protects. Live counts: `bats tests/ --count` and `ls tests/*.bats | wc -l`.
 - `README.md` — user-facing install/usage guide + documented escape hatches for CDN staleness, SHA pinning, and hook opt-out.
 
 ## Parity invariant (critical)
@@ -215,6 +215,19 @@ One command that answers "will this work tonight?" without reading source. It ex
 
 Reports hook health per event, re-tag need, marker counts (found / reaped / live), time since last agent output, effective watch configuration, sleep blockers, and power state — then a verdict of would-sleep / would-wait / degraded. **Exits non-zero when degraded**, so it works as a health check. It reaps stale markers as a side effect (that is cleanup, not diagnosis) but never sleeps the machine — asserted explicitly in `tests/doctor.bats`.
 
+### Numeric config is validated at assignment
+
+Every `SAC_*` integer override goes through `_cfg_int`, which falls back to the default and records a warning surfaced on the actionable path. This is not politeness. These values reach arithmetic contexts, and under `set -u` bash reads a non-numeric word there as a variable name, finds it unset, and aborts — so one typo in a tuning knob would end the watch instead of being ignored.
+
+`_cfg_int` answers in `$REPLY` rather than on stdout: command substitution would run it in a subshell and the warning would die there, leaving a bad value silently corrected.
+
+### Two shell-level traps this code has already fallen into
+
+- **`cmd | awk … || echo 0` under `set -o pipefail`.** awk's `END` block still prints when the upstream fails, and the failing pipeline then fires the fallback as well — two values where the contract promises one. Capture into a variable and validate at a single exit point.
+- **State assigned inside `$( )` is lost.** Anything a helper needs to accumulate for its caller must come back through `$REPLY` or a file, never a subshell.
+
+`tests/lib/common.bash` now writes `set -uo pipefail` into every extracted-function harness, because the first of these shipped precisely because the tests ran under laxer options than production.
+
 ## Unattended operation
 
 This command is started by someone who is about to stop watching it. Anything that can block indefinitely is a defect:
@@ -394,7 +407,7 @@ Fixed:
 - **Unattended by default.** Logging on, update check opt-in, every prompt time-bounded, blockers no longer abort when nobody is there to answer.
 - **`--doctor`.** The diagnostic that would have caught this from the outside on day one.
 
-Tests: 133 → 213. New files: `hook-detection-resilience.bats`, `session-activity.bats`, `verified-sleep.bats`, `doctor.bats`. Rewritten: `smart-watch-semantics.bats`, `smart-watch-runtime.bats`, `default-mode.bats`.
+Tests: 133 → 218. New files: `hook-detection-resilience.bats`, `session-activity.bats`, `verified-sleep.bats`, `doctor.bats`. Rewritten: `smart-watch-semantics.bats`, `smart-watch-runtime.bats`, `default-mode.bats`.
 
 **Deliberately broken contracts** (old tests asserted these; they were the bugs): the F-01 cold-start hold, the F-08 24-hour blind reaper, and PID-mode fallback on hook-detection failure. Each replaced by a test asserting the new contract rather than deleted.
 

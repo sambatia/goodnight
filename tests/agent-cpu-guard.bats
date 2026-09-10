@@ -84,7 +84,7 @@ setup() {
 @test "--no-cpu-guard disables it" {
   run grep -n 'CPU_GUARD=false' "$REPO_ROOT/sleep-after-claude"
   [ "$status" -eq 0 ]
-  run grep -n 'AGENT_CPU_BUSY_PCT="\${SAC_AGENT_CPU_BUSY_PCT:-20}"' "$REPO_ROOT/sleep-after-claude"
+  run grep -n '_cfg_int SAC_AGENT_CPU_BUSY_PCT' "$REPO_ROOT/sleep-after-claude"
   [ "$status" -eq 0 ]
 }
 
@@ -98,12 +98,72 @@ setup() {
   [ "$status" -eq 0 ]
 }
 
-@test "log-summary counts the events the code actually emits" {
-  # The vocabulary was left on pre-rewrite names, so every current event
-  # reported zero — a report that is confidently wrong.
-  for evt in SMART_IDLE_REACHED SLEEP_CONFIRMED SLEEP_REFUSED SLEPT_EXTERNALLY HOOKS_DEGRADED; do
-    run grep -c "$evt" "$REPO_ROOT/sleep-after-claude"
-    # Present both as an emitted event and in the summary vocabulary.
-    [ "$output" -ge 2 ]
-  done
+
+@test "a failing ps yields ONE zero, not two, under pipefail" {
+  # awk's END block prints its 0 even when ps fails; with pipefail the
+  # failing pipeline then fires the fallback too. The result was "0\n0",
+  # which fails the numeric guard and quietly disables the signal.
+  shim pgrep 'echo 101'
+  shim ps 'exit 1'
+  run bash -c "set -uo pipefail; source '$BATS_TEST_TMPDIR/cpu.sh'; agent_cpu_centiseconds"
+  [ "$output" = "0" ]
+  [ "$(printf '%s' "$output" | wc -l | tr -d ' ')" = "0" ]
+}
+
+@test "a malformed tuning value falls back loudly instead of killing the run" {
+  # Under set -u a non-numeric word in an arithmetic context is not a
+  # harmless fallback — bash reads it as a variable name, finds it
+  # unset, and aborts the watch.
+  local H; H="$(mktemp -d)"
+  run env HOME="$H" SAC_AGENT_CPU_BUSY_PCT=bogus SAC_IDLE_SECONDS=1 \
+    SAC_NO_GUM=1 SAC_NO_GLOW=1 bash "$REPO_ROOT/sleep-after-claude" \
+    --smart --unattended --dry-run --no-preflight --allow-battery \
+    --no-auto-caffeinate --no-sound --no-log --no-repair
+  rm -rf "$H"
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "is not a positive integer"
+  assert_contains "$output" "Dry run complete"
+}
+
+@test "config validation reports through REPLY, not a subshell" {
+  # $(_cfg_int ...) would run in a subshell, so the warning it records
+  # would die there: the fallback would work and the user would never
+  # learn their setting was ignored.
+  block="$(sed -n '/^_cfg_int() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")"
+  assert_contains "$block" 'REPLY='
+  assert_not_contains "$block" "printf '%s' \"\$fallback\""
+  run grep -c '_cfg_int SAC_' "$REPO_ROOT/sleep-after-claude"
+  [ "$output" -ge 8 ]
+}
+
+@test "log-summary derives its vocabulary from the log, not a fixed list" {
+  # A hand-kept list drifts the moment an event is renamed, and had.
+  run grep -n 'for pat in SMART_WATCH_START' "$REPO_ROOT/sleep-after-claude"
+  [ "$status" -ne 0 ]
+  run grep -n 'sort | uniq -c | sort -rn' "$REPO_ROOT/sleep-after-claude"
+  [ "$status" -eq 0 ]
+}
+
+@test "log-summary actually counts real events from a real log" {
+  setup_sandbox
+  local L="$BATS_TEST_TMPDIR/sac.log"
+  cat >"$L" <<'LOGEOF'
+[2026-09-10 03:50:57] SMART_WATCH_START busy_count=1 hooks=ok
+[2026-09-10 04:48:19] SMART_IDLE_REACHED waited=3442s
+[2026-09-10 04:48:23] SLEEP_ATTEMPT n=1/3 ctx=watch
+[2026-09-10 04:48:35] SLEEP_CONFIRMED n=1 via=kern.sleeptime
+[2026-09-10 04:48:35] SLEEP_CONFIRMED n=1 via=kern.sleeptime
+LOGEOF
+  run env SAC_NO_GLOW=1 bash "$REPO_ROOT/sleep-after-claude" --log-summary --log-file "$L"
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "| SLEEP_CONFIRMED | 2 |"
+  assert_contains "$output" "| SMART_IDLE_REACHED | 1 |"
+}
+
+@test "watch-pid checks for external sleep before its timeout branch" {
+  block="$(awk '/^  while \[\[ "\$\{SMART_WATCH_DONE/,/^  done$/' "$REPO_ROOT/sleep-after-claude")"
+  sleep_line="$(printf '%s\n' "$block" | grep -n 'SLEPT_EXTERNALLY' | head -1 | cut -d: -f1)"
+  timeout_line="$(printf '%s\n' "$block" | grep -n 'Timeout of' | head -1 | cut -d: -f1)"
+  [ -n "$sleep_line" ] && [ -n "$timeout_line" ]
+  [ "$sleep_line" -lt "$timeout_line" ]
 }

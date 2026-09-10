@@ -91,12 +91,12 @@ load 'lib/common'
 }
 
 @test "stale-marker threshold is configurable and defaults to 15 minutes" {
-  run grep -E 'SMART_STALE_MARKER_MINS="\$\{SAC_STALE_MARKER_MINUTES:-15\}"' "$REPO_ROOT/sleep-after-claude"
+  run grep -E '_cfg_int SAC_STALE_MARKER_MINUTES "\$\{SAC_STALE_MARKER_MINUTES:-15\}" 15' "$REPO_ROOT/sleep-after-claude"
   [ "$status" -eq 0 ]
 }
 
 @test "idle threshold is configurable and defaults to 5 minutes" {
-  run grep -E 'SMART_IDLE_SECONDS="\$\{SAC_IDLE_SECONDS:-300\}"' "$REPO_ROOT/sleep-after-claude"
+  run grep -E '_cfg_int SAC_IDLE_SECONDS "\$\{SAC_IDLE_SECONDS:-300\}" 300' "$REPO_ROOT/sleep-after-claude"
   [ "$status" -eq 0 ]
 }
 

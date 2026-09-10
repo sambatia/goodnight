@@ -161,11 +161,10 @@ stop_loop() {
 }
 
 @test "smart mode runs end to end and reaches the sleep step" {
-  sed 's/^SMART_IDLE_SECONDS="\${SAC_IDLE_SECONDS:-300}"/SMART_IDLE_SECONDS="${SAC_IDLE_SECONDS:-1}"/' \
-    "$REPO_ROOT/sleep-after-claude" >"$BATS_TEST_TMPDIR/sac-fast"
-  chmod +x "$BATS_TEST_TMPDIR/sac-fast"
-  grep -q 'SAC_IDLE_SECONDS:-1' "$BATS_TEST_TMPDIR/sac-fast"
-
+  # Drive the real binary with the documented env knob rather than
+  # sed-patching a copy of it: the copy has to be re-taught the source
+  # layout every time that line moves, and it tests a file that is not
+  # the one users run.
   mkdir -p "$HOME/.claude"
   cat >"$HOME/.claude/settings.json" <<'JSON'
 {
@@ -187,7 +186,7 @@ JSON
   (sleep 1 && rm -f "$BUSY_DIR/session-1") &
   local cleanup_pid=$!
 
-  run bash "$BATS_TEST_TMPDIR/sac-fast" \
+  run env SAC_IDLE_SECONDS=1 bash "$REPO_ROOT/sleep-after-claude" \
     --smart \
     --no-preflight \
     --allow-battery \

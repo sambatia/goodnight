@@ -76,7 +76,11 @@ assert_not_contains() {
 extract_from_script() {
   local out="$1"
   shift
-  : >"$out"
+  # Reproduce the script's own shell options. Without these the
+  # extracted functions run under laxer rules than they ever will in
+  # production, and the harness silently blesses bugs it cannot see —
+  # a `set -o pipefail` double-emit shipped exactly this way.
+  printf 'set -uo pipefail\n' >"$out"
   sed -n "/^HOOK_MATCH_JQ=/,/;'\$/p" "$REPO_ROOT/sleep-after-claude" >>"$out"
   local fn
   for fn in "$@"; do
