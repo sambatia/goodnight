@@ -20,7 +20,7 @@ macOS Bash utility `sleep-after-claude` (aliased to `goodnight`) that watches a 
 - `scripts/check-parity.sh` — verifies the embedded payload matches the standalone script. See "Parity invariant" below.
 - `.githooks/pre-commit` — opt-in legacy hook that runs the parity check when either script is staged. Enable with `git config core.hooksPath .githooks`. Superseded by the `pre-commit` framework config at `.pre-commit-config.yaml`.
 - `.pre-commit-config.yaml` — canonical pre-commit config. Runs parity + `shellcheck` + `shfmt` + repo hygiene on every commit.
-- `tests/` — bats-core regression suite (179 tests). Each `*.bats` file's header comment names the audit finding(s) or subsystem it protects. Live counts: `bats tests/ --count` and `ls tests/*.bats | wc -l`.
+- `tests/` — bats-core regression suite (186 tests). Each `*.bats` file's header comment names the audit finding(s) or subsystem it protects. Live counts: `bats tests/ --count` and `ls tests/*.bats | wc -l`.
 - `README.md` — user-facing install/usage guide + documented escape hatches for CDN staleness, SHA pinning, and hook opt-out.
 
 ## Parity invariant (critical)
@@ -365,9 +365,11 @@ Fixed:
 - **Unattended by default.** Logging on, update check opt-in, every prompt time-bounded, blockers no longer abort when nobody is there to answer.
 - **`--doctor`.** The diagnostic that would have caught this from the outside on day one.
 
-Tests: 133 → 179. New files: `hook-detection-resilience.bats`, `session-activity.bats`, `verified-sleep.bats`, `doctor.bats`. Rewritten: `smart-watch-semantics.bats`, `smart-watch-runtime.bats`, `default-mode.bats`.
+Tests: 133 → 186. New files: `hook-detection-resilience.bats`, `session-activity.bats`, `verified-sleep.bats`, `doctor.bats`. Rewritten: `smart-watch-semantics.bats`, `smart-watch-runtime.bats`, `default-mode.bats`.
 
 **Deliberately broken contracts** (old tests asserted these; they were the bugs): the F-01 cold-start hold, the F-08 24-hour blind reaper, and PID-mode fallback on hook-detection failure. Each replaced by a test asserting the new contract rather than deleted.
+
+**Verified in production 2026-09-10.** The rebuilt command was left running unattended against a machine with a live Claude session and a 4h-old Codex run. It waited 3,442s for both to go quiet, released caffeinate, and confirmed sleep against `kern.sleeptime` on the first attempt — with two sleep blockers still recorded at the moment it asked. That last detail is the point: the previous code would have reported success there regardless.
 
 **Lesson for the next cycle:** the tests were green the whole time this was broken. They asserted that `hooks_installed` returned true for a *tagged* fixture — never that it survived a fixture whose tag had been stripped by someone else. When a component's correctness depends on data another program owns, the test has to model that program misbehaving.
 
