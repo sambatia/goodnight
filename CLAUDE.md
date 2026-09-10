@@ -159,11 +159,22 @@ Three deliberate departures from the previous behaviour, each fixing a way the m
 
 - **No cold-start hold.** The old loop refused to sleep until it had personally witnessed a marker appear (the F-01 guard), so the most common invocation of all — every agent already finished before you type `goodnight` — waited forever. Starting quiet is now a valid path to sleep; the transcript check is what makes that safe.
 - **A hard timeout.** The old loop was `while true` with no elapsed check. `--timeout` bounded the PID path only, so one wedged marker meant the Mac never slept. Returns `2` on timeout; the caller sleeps anyway.
-- **Adaptive poll.** 5s while waiting, 1s during the final countdown, through `micro_sleep` (no fork per tick). ~700 wakeups over an eight-hour night instead of ~14,000.
+- **Adaptive poll.** 5s while waiting, tightening to 1s only for the last 30s of the countdown, through `micro_sleep` (no fork per tick). The interval *is* the race window — a session that resumes just after a check is one we could sleep on top of — so it wants to be small at the moment we act and no smaller than necessary before that.
+- **Stands down if the Mac slept anyway.** `smart_watch_loop` samples `kern.sleeptime` at entry and each tick; if it moves, the machine slept by other means (lid, Apple menu, another tool) and the loop returns `3` and exits without sleeping. Without this the wall clock — which keeps running through a suspension — reads as elapsed watch time, so closing the lid at midnight and opening it at nine fires the timeout branch instantly and puts the machine straight back to sleep in the user's hands.
+
+### Cost of the two signals
+
+Marker counting is O(markers × project dirs) in `stat`s; the session-log scan is O(all transcripts) and those accumulate forever with no pruning. The scan is therefore the expensive half, and it is **skipped entirely whenever a marker already says busy** — its answer cannot change the outcome there. That confines the full traversal to the genuinely-idle case, where the loop is also polling lazily. `reap_dead_markers` uses `stat` and second arithmetic rather than `find -mmin`, which costs the same fork but makes the stale window mean exactly what it says instead of rounding to whole minutes.
 
 Default-mode selection: **smart, unconditionally**. Falling back to `--watch-pid` on a hook-detection failure is precisely what made the outage invisible — the command kept running, just uselessly. Smart mode repairs its own hooks and degrades to transcript-only detection if it cannot, so there is no failure PID mode needs to cover. `--pid`, `--wait-for-start`, and `--watch-pid` each select PID mode explicitly; without that, the smart default would silently ignore the flag the user just passed. Early-exit modes (`--install-hooks`, `--uninstall-hooks`, `--doctor`, `--preflight`, `--list`, `--log-summary`, `--sleep-now`) bypass selection entirely.
 
 Regression tests: `tests/smart-watch-semantics.bats` (source contracts), `tests/smart-watch-runtime.bats` (drives the loop), `tests/default-mode.bats` (selection + repair).
+
+### Known limitation: silent non-Claude tool calls
+
+An agent with no busy marker is judged purely on its session log. Claude Code sessions are safe here — a long tool call still holds a marker for the whole turn — but Codex has no marker, so a Codex tool call that runs longer than `--idle` (default 5m) without writing to its rollout log looks idle and the Mac may sleep under it.
+
+This is deliberately not papered over with a CPU-activity guard. An agent blocked on a network round trip burns no CPU while genuinely working, so CPU could only ever veto a sleep, never authorise one — and a veto that never clears is the failure this whole cycle was about. Raise `--idle` if it bites; the knob is the honest fix.
 
 ## Verified sleep
 

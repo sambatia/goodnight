@@ -260,6 +260,7 @@ Passing `--json` emits a machine-readable preflight report. The `scan_ok`, `can_
 - [x] **Watches Codex too, not just Claude Code** — busy markers only describe Claude sessions, so a Claude-only watch would sleep the Mac on top of a running Codex job. Both `~/.claude/projects` and `~/.codex/sessions` are scanned; add more with `SAC_EXTRA_ACTIVITY_DIRS`.
 - [x] **Self-repairing hooks** — a damaged `~/.claude/settings.json` integration is detected and fixed in place rather than silently disabling idle detection.
 - [x] **Verified sleep** — `pmset sleepnow` reports success even when macOS refuses. goodnight confirms against the kernel and retries, and tells you when it couldn't.
+- [x] **Stands down if you sleep the Mac yourself** — close the lid mid-watch and goodnight notices on wake and exits, instead of putting the machine straight back to sleep in your hands.
 - [x] **`--doctor`** — one command that reports whether the whole thing will actually work tonight. Exits non-zero when degraded, so it works as a health check.
 - [x] **Process-exit watching** — `--watch-pid` sleeps when the `claude` process dies. Use for non-interactive Claude invocations.
 - [x] **Sleep-now shortcut** — `--sleep-now` skips detection entirely: preflight + handle blockers + sleep immediately.
@@ -506,6 +507,16 @@ goodnight couldn't repair the hooks in `~/.claude/settings.json` — usually bec
 Note that repaired hooks only apply to Claude Code sessions started *afterwards* — a session already running has its hook config loaded.
 
 ---
+
+**It slept while an agent was still working**
+
+Agents without a busy marker — Codex, chiefly — are judged purely on their session log. A tool call that runs longer than `--idle` (default 5 minutes) without writing anything looks idle. Raise it for long jobs:
+
+```bash
+goodnight --idle 1800        # half an hour of quiet required
+```
+
+Claude Code sessions aren't affected: a long tool call holds its busy marker for the whole turn.
 
 **goodnight is waiting and I don't know what for**
 

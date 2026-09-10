@@ -13,9 +13,12 @@ setup() {
   setup_sandbox
   export BUSY_DIR="$HOME/.local/state/goodnight/busy"
   export CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
+  export STAMP_FILE="$BATS_TEST_TMPDIR/sleeptime"
+  echo 1000 >"$STAMP_FILE"
   mkdir -p "$BUSY_DIR" "$CLAUDE_PROJECTS_DIR/proj"
   {
     echo 'BUSY_DIR="'"$BUSY_DIR"'"'
+    echo 'STAMP_FILE="'"$STAMP_FILE"'"'
     echo 'CLAUDE_PROJECTS_DIR="'"$CLAUDE_PROJECTS_DIR"'"'
     echo 'AGENT_ACTIVITY_DIRS=("'"$CLAUDE_PROJECTS_DIR"'")'
     echo 'SMART_IDLE_SECONDS=2'
@@ -31,6 +34,7 @@ setup() {
     echo 'clear_line() { :; }'
     echo 'log_event()  { :; }'
     echo 'micro_sleep(){ sleep "$1"; }'
+    echo 'sleep_stamp() { cat "$STAMP_FILE" 2>/dev/null; }'
     sed -n '/^elapsed_label() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^transcript_for_session() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^transcript_active_within() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
@@ -180,4 +184,32 @@ JSON
   [ "$status" -eq 0 ]
   assert_contains "$output" "Dry run complete"
   assert_not_contains "$output" "PID smart not found"
+}
+
+@test "a Mac that slept on its own stands the watcher down instead of re-sleeping it" {
+  # Lid closed at midnight, opened at nine. The wall clock kept running
+  # through the suspension, so without this the timeout branch fires
+  # instantly and puts the machine straight back to sleep in your hands.
+  touch "$BUSY_DIR/still-busy"
+  echo '{}' >"$CLAUDE_PROJECTS_DIR/proj/still-busy.jsonl"
+  (sleep 2 && echo 2000 >"$STAMP_FILE") &
+  local bump_pid=$!
+  run drive_loop
+  wait "$bump_pid" 2>/dev/null || true
+  assert_contains "$output" "slept while goodnight was watching"
+  assert_contains "$output" "LOOP_RETURNED rc=3"
+}
+
+@test "an unchanged sleep stamp does not stand the watcher down" {
+  run drive_loop
+  assert_not_contains "$output" "slept while goodnight was watching"
+  assert_contains "$output" "LOOP_RETURNED rc=0"
+}
+
+@test "the session-log scan is skipped while a marker already says busy" {
+  # The scan stats every transcript under every activity root, and
+  # those accumulate forever. It must not run when its answer cannot
+  # change the outcome.
+  block="$(sed -n '/^smart_watch_loop() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")"
+  assert_contains "$block" '[[ "$busy" == "0" ]] && transcript_active_within'
 }

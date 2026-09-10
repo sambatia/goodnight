@@ -2553,23 +2553,26 @@ reap_dead_markers() {
     echo 0
     return
   }
-  local f sid tpath reaped=0
+  local f sid tpath probe mtime age reaped=0 now cutoff
+  now="$(date +%s)"
+  cutoff=$((SMART_STALE_MARKER_MINS * 60))
   for f in "$BUSY_DIR"/*; do
     [[ -f "$f" ]] || continue
     sid="$(basename "$f")"
+    # The session transcript is the authority on liveness. Only when
+    # there is none to consult does the marker's own age stand in, so an
+    # unrecognised session still gets a full stale window of benefit of
+    # the doubt before we discount it.
     tpath="$(transcript_for_session "$sid" || true)"
-    if [[ -n "$tpath" ]]; then
-      # Transcript exists — it is the authority on liveness.
-      if [[ -z "$(find "$tpath" -mmin -"$SMART_STALE_MARKER_MINS" -print -quit 2>/dev/null)" ]]; then
-        rm -f "$f" 2>/dev/null && reaped=$((reaped + 1))
-      fi
-    else
-      # No transcript to corroborate. Fall back to the marker's own age
-      # so an unrecognised session still gets a full stale window of
-      # benefit of the doubt before we discount it.
-      if [[ -z "$(find "$f" -mmin -"$SMART_STALE_MARKER_MINS" -print -quit 2>/dev/null)" ]]; then
-        rm -f "$f" 2>/dev/null && reaped=$((reaped + 1))
-      fi
+    probe="${tpath:-$f}"
+    # stat rather than `find -mmin`: one fork either way, but this
+    # compares exact seconds instead of find's minute granularity, so
+    # the stale window means what it says.
+    mtime="$(stat -f %m "$probe" 2>/dev/null)"
+    [[ "$mtime" =~ ^[0-9]+$ ]] || continue
+    age=$((now - mtime))
+    if ((age > cutoff)); then
+      rm -f "$f" 2>/dev/null && reaped=$((reaped + 1))
     fi
   done
   echo "$reaped"
@@ -2771,12 +2774,33 @@ smart_watch_loop() {
   local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
   local tick=0 poll
   local start_ts elapsed idle_for remaining
-  local last_log=0
+  local last_log=0 entry_sleep_stamp
   start_ts=$(date +%s)
+  entry_sleep_stamp="$(sleep_stamp)"
 
   while true; do
     now=$(date +%s)
     elapsed=$((now - start_ts))
+
+    # Did the Mac sleep while we were watching — lid closed, Apple menu,
+    # another tool? Then the job is done and this process is simply the
+    # last thing to notice.
+    #
+    # Without this the wall clock, which kept running through the
+    # suspension, reads as elapsed watch time: close the lid at
+    # midnight, open it at nine, and the timeout branch below fires
+    # instantly and puts the machine straight back to sleep in your
+    # hands. Exit instead, and say why.
+    if [[ -n "$entry_sleep_stamp" ]]; then
+      local now_sleep_stamp
+      now_sleep_stamp="$(sleep_stamp)"
+      if [[ -n "$now_sleep_stamp" && "$now_sleep_stamp" != "$entry_sleep_stamp" ]]; then
+        clear_line
+        print_ok "The Mac slept while goodnight was watching — nothing left to do."
+        log_event "SLEPT_EXTERNALLY after=${elapsed}s"
+        return 3
+      fi
+    fi
 
     # Hard cap. The previous loop had none: a single stuck marker meant
     # `goodnight` ran until morning and the Mac never slept. --timeout
@@ -2790,7 +2814,11 @@ smart_watch_loop() {
 
     busy="$(count_busy_sessions)"
     recent_write=false
-    if transcript_active_within "$SMART_IDLE_SECONDS"; then
+    # Only consult the session-log scan when the markers already say
+    # idle. When a session is known busy the scan cannot change the
+    # outcome, and it is the expensive half: it stats every transcript
+    # under every activity root, and those accumulate forever.
+    if [[ "$busy" == "0" ]] && transcript_active_within "$SMART_IDLE_SECONDS"; then
       recent_write=true
     fi
 
@@ -2813,9 +2841,16 @@ smart_watch_loop() {
         last_log=$now
         echo "  … all agents idle, sleeping in $(elapsed_label "$remaining")"
       fi
-      # Poll fast during the countdown so a session waking back up is
-      # noticed promptly; the window is short and bounded.
-      poll=1
+      # Tighten the poll only for the last stretch of the countdown.
+      # The interval is the race window — a session that resumes just
+      # after a check is one we could sleep on top of — so it wants to
+      # be small at the moment we are about to act, and no smaller than
+      # it needs to be for the several minutes before that.
+      if ((remaining <= 30)); then
+        poll=1
+      else
+        poll=5
+      fi
     else
       idle_start=0
       if [[ "$USE_SPINNER" == true ]]; then
@@ -3586,7 +3621,15 @@ if [[ "$SMART_WATCH" == true ]]; then
   SMART_WATCH_RC=$?
   WATCH_STARTED=false
   clear_line
-  if ((SMART_WATCH_RC == 2)); then
+  if ((SMART_WATCH_RC == 3)); then
+    # The Mac already slept by other means. Releasing caffeinate and
+    # issuing another sleep here would put it straight back down in
+    # the user's hands, seconds after they woke it.
+    log_event "SMART_WATCH_EXIT_ALREADY_SLEPT"
+    notify_macos "Mac already slept — goodnight stood down"
+    print_done "Nothing to do — the Mac slept on its own."
+    exit 0
+  elif ((SMART_WATCH_RC == 2)); then
     log_event "SMART_WATCH_TIMEOUT — proceeding to sleep"
     notify_macos "goodnight timeout reached — sleeping"
   else
