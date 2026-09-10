@@ -8,6 +8,7 @@ setup() {
   export GOODNIGHT_LOCK_DIR="$HOME/.local/state/goodnight/lock"
   # Extract the lock helpers in isolation.
   {
+    harness_preamble
     echo 'GOODNIGHT_LOCK_DIR="'"$GOODNIGHT_LOCK_DIR"'"'
     echo 'GOODNIGHT_LOCK_ACQUIRED=false'
     echo 'BOLD="" RESET=""'

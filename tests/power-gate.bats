@@ -10,6 +10,7 @@ setup() {
   # the bash-fallback path by setting SAC_NO_GUM=1, so ui_panel just
   # prints the hand-drawn card.
   {
+    harness_preamble
     sed -n '/^have_gum() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^have_glow() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^ui_panel() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"

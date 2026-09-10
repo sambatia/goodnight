@@ -68,6 +68,21 @@ assert_not_contains() {
   fi
 }
 
+# The shell options sleep-after-claude actually runs under.
+#
+# Any harness that executes lifted production code must apply these, or
+# it grades that code under easier rules than it will ever face and
+# blesses bugs it structurally cannot observe. A `set -o pipefail`
+# double-emit shipped through CI and human review exactly this way: the
+# test asserted the right value and passed, because the harness could
+# not see the failure mode at all.
+#
+# Emit into a generated harness file:   harness_preamble
+# Prefix an inline `bash -c` body with: $(harness_preamble)
+harness_preamble() {
+  printf 'set -uo pipefail\n'
+}
+
 # Lift selected function definitions (plus the shared jq predicate) out
 # of the real script into a sourceable file, so unit tests exercise the
 # shipped implementation instead of a copy that can drift from it.
@@ -80,7 +95,7 @@ extract_from_script() {
   # extracted functions run under laxer rules than they ever will in
   # production, and the harness silently blesses bugs it cannot see —
   # a `set -o pipefail` double-emit shipped exactly this way.
-  printf 'set -uo pipefail\n' >"$out"
+  harness_preamble >"$out"
   sed -n "/^HOOK_MATCH_JQ=/,/;'\$/p" "$REPO_ROOT/sleep-after-claude" >>"$out"
   local fn
   for fn in "$@"; do

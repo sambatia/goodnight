@@ -16,8 +16,13 @@ setup() {
   # real values it uses. If we reproduce the exact comparison the
   # real function does, a mismatch must trigger the REFUSING branch.
   cat >"$BATS_TEST_TMPDIR/sha-check.sh" <<'SCRIPT'
-# Extracted SHA-check decision from ensure_jq. Keep this in sync if
-# the remediation changes the check.
+set -uo pipefail
+# NOTE: this is a hand-written reimplementation of the SHA-check
+# decision in ensure_jq, not the real function lifted out of it. It can
+# therefore drift from the code it claims to cover while still passing
+# — the same failure shape as a hand-kept event vocabulary. Lifting the
+# real branch would be strictly better; until then, treat a change to
+# ensure_jq's check as requiring a change here.
 C_BOLD="" C_RESET=""
 warn() { echo "WARN $1" >&2; }
 try_install_or_refuse() {

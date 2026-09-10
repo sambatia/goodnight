@@ -17,6 +17,7 @@ setup() {
   echo 1000 >"$STAMP_FILE"
   mkdir -p "$BUSY_DIR" "$CLAUDE_PROJECTS_DIR/proj"
   {
+    harness_preamble
     echo 'BUSY_DIR="'"$BUSY_DIR"'"'
     echo 'STAMP_FILE="'"$STAMP_FILE"'"'
     echo 'CLAUDE_PROJECTS_DIR="'"$CLAUDE_PROJECTS_DIR"'"'

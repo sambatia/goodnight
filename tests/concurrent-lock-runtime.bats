@@ -12,6 +12,7 @@ setup() {
   # and tries to acquire. Prints "ACQUIRED" or "REJECTED".
   cat >"$BATS_TEST_TMPDIR/try-lock.sh" <<EOF
 #!/usr/bin/env bash
+set -uo pipefail
 GOODNIGHT_LOCK_DIR="$GOODNIGHT_LOCK_DIR"
 GOODNIGHT_LOCK_ACQUIRED=false
 BOLD="" RESET=""

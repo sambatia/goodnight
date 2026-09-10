@@ -17,6 +17,7 @@ setup() {
   : >"$CALLS"
 
   {
+    harness_preamble
     echo 'SLEEP_MAX_ATTEMPTS=3'
     echo 'SLEEP_VERIFY_SECS=1'
     echo 'SLEEP_RETRY_BACKOFF_SECS=0'
