@@ -3460,7 +3460,7 @@ if [[ "$SLEEP_NOW" == true ]]; then
     fi
     if [[ "$PREFLIGHT_SCAN_OK" != true ]]; then
       log_event "PREFLIGHT_SCAN_FAILED (sleep-now)"
-      if [[ "$FORCE" == false ]]; then
+      if [[ "$FORCE" == false && "$UNATTENDED" == false ]]; then
         if [[ "$STDIN_IS_TTY" == true ]]; then
           if ! ui_confirm "Sleep-blocker scan failed. Proceed anyway?"; then
             print_warn "Aborted by user."
@@ -3577,7 +3577,7 @@ if [[ "$SMART_WATCH" == true ]]; then
     fi
     if [[ "$PREFLIGHT_SCAN_OK" != true ]]; then
       log_event "PREFLIGHT_SCAN_FAILED (smart)"
-      if [[ "$FORCE" == false ]]; then
+      if [[ "$FORCE" == false && "$UNATTENDED" == false ]]; then
         if ! ui_confirm "Sleep-blocker scan failed. Proceed anyway?"; then
           print_warn "Aborted."
           exit 0
@@ -3715,7 +3715,7 @@ if [[ "${SMART_WATCH_DONE:-false}" != true ]]; then
 
     if [[ "$PREFLIGHT_SCAN_OK" != true ]]; then
       log_event "PREFLIGHT_SCAN_FAILED"
-      if [[ "$FORCE" == false ]]; then
+      if [[ "$FORCE" == false && "$UNATTENDED" == false ]]; then
         if [[ "$STDIN_IS_TTY" == true ]]; then
           if ! ui_confirm "Sleep-blocker scan failed. Proceed anyway?"; then
             print_warn "Aborted by user. Claude is still running; caffeinate untouched."

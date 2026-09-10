@@ -85,3 +85,27 @@ print("OK")')"
     printf '%s\n' "$output" | python3 -c 'import json,sys; json.load(sys.stdin)'
   done
 }
+
+@test "unattended: a failed blocker scan proceeds instead of aborting the run" {
+  # The scan is advisory — the sleep itself is verified and retried. A
+  # transient pmset failure must not silently cancel the whole night's
+  # run, which is what fail-closed amounts to when nobody is awake to
+  # answer the prompt.
+  count="$(grep -c '"\$FORCE" == false && "\$UNATTENDED" == false' "$REPO_ROOT/sleep-after-claude")"
+  [ "$count" -eq 3 ]
+}
+
+@test "unattended: a failed scan still reaches the sleep step" {
+  # setup() already built the sandbox; re-running it here left the
+  # shim dir on PATH twice and made the test's state harder to reason
+  # about than the thing it was testing.
+  shim pmset 'exit 1'
+  shim pgrep 'exit 1'
+  mkdir -p "$HOME/.claude/projects" "$HOME/.local/state/goodnight/busy"
+  run env SAC_IDLE_SECONDS=1 bash "$REPO_ROOT/sleep-after-claude" \
+    --smart --unattended --dry-run --allow-battery \
+    --no-auto-caffeinate --no-sound --no-log --no-repair
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "Dry run complete"
+  assert_not_contains "$output" "Aborted"
+}
