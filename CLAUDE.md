@@ -11,6 +11,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `CONTRIBUTING.md`, `SECURITY.md`, and `PUBLIC_RELEASE_CHECKLIST.md` are domain-specific satellites. Keep them consistent with `README.md` and reference `CLAUDE.md` for implementation details instead of duplicating architecture.
 - `.github/workflows/ci.yml` and `.pre-commit-config.yaml` define the enforced verification pipeline. If docs and these files disagree about checks, update the docs to match the configs.
 
+## Naming
+
+Repo `goodnight`, command `goodnight`, binary `sleep-after-claude`. The split is deliberate: renaming the binary would migrate every existing install's log (`~/.local/state/sleep-after-claude.log`), cache (`~/.cache/sleep-after-claude`) and `SLEEP_AFTER_CLAUDE_*` / `SAC_*` environment for no functional gain. State that the tool owns outright — `~/.local/state/goodnight/`, the `# goodnight-hook` sentinel — already uses the short name.
+
+The repo was renamed from `sleep-after-claude` on 2026-09-10. **Never create a new repo under that old name**: GitHub's redirect survives indefinitely unless the old name is reclaimed, and `raw.githubusercontent.com` follows the rename too (verified empirically at the time), so old installs keep self-updating only while that redirect stands.
+
 ## Repository layout
 
 macOS Bash utility `sleep-after-claude` (aliased to `goodnight`) that watches a Claude Code session and sleeps the Mac when it finishes. Distributed via a self-extracting installer over `curl | bash`.
