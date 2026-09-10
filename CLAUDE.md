@@ -20,7 +20,7 @@ macOS Bash utility `sleep-after-claude` (aliased to `goodnight`) that watches a 
 - `scripts/check-parity.sh` — verifies the embedded payload matches the standalone script. See "Parity invariant" below.
 - `.githooks/pre-commit` — opt-in legacy hook that runs the parity check when either script is staged. Enable with `git config core.hooksPath .githooks`. Superseded by the `pre-commit` framework config at `.pre-commit-config.yaml`.
 - `.pre-commit-config.yaml` — canonical pre-commit config. Runs parity + `shellcheck` + `shfmt` + repo hygiene on every commit.
-- `tests/` — bats-core regression suite. Each `*.bats` file's header comment names the audit finding(s) or subsystem it protects. Live counts: `bats tests/ --count` and `ls tests/*.bats | wc -l`.
+- `tests/` — bats-core regression suite (199 tests). Each `*.bats` file's header comment names the audit finding(s) or subsystem it protects. Live counts: `bats tests/ --count` and `ls tests/*.bats | wc -l`.
 - `README.md` — user-facing install/usage guide + documented escape hatches for CDN staleness, SHA pinning, and hook opt-out.
 
 ## Parity invariant (critical)
@@ -82,36 +82,140 @@ Regression tests: `tests/installer-deps.bats` (happy + offline), `tests/installe
 
 `--smart` mode sleeps the Mac when all Claude Code **sessions** are idle, not when the `claude` process exits. Process-exit watching (`--watch-pid`) doesn't work for the common case: a user leaves a Claude REPL open in a terminal tab, walks away, and the process lives until they quit the tab in the morning.
 
-Hooks work by writing two entries into `~/.claude/settings.json`:
+Hooks work by writing three entries into `~/.claude/settings.json`:
 
-- `UserPromptSubmit` hook — `touch $BUSY_DIR/<session_id>` when the user sends a new message.
-- `Stop` hook — `rm -f $BUSY_DIR/<session_id>` when Claude finishes its response and returns control.
+- `UserPromptSubmit` — `touch $BUSY_DIR/<session_id>` when the user sends a new message.
+- `Stop` — `rm -f $BUSY_DIR/<session_id>` when Claude finishes its response and returns control.
+- `SessionEnd` — same removal, covering the ways a session leaves without a final turn (quit mid-response, closed terminal, crash). Added 2026-09-10 after the marker directory was found holding 30 orphans accumulated over two months.
 
-`BUSY_DIR` defaults to `~/.local/state/goodnight/busy`. `smart_watch_loop` polls this directory every 2s and fires sleep when the count stays at 0 for `SMART_IDLE_SECONDS` (default 30s). Stale markers older than `SMART_STALE_MARKER_MINS` (default 1440 = 24h, override via `SAC_STALE_MARKER_MINUTES`) are reaped — threshold is intentionally loose so a legitimately long-running Claude task isn't reaped mid-work (F-08).
+`BUSY_DIR` defaults to `~/.local/state/goodnight/busy`.
 
 Hook command strings are written carefully:
 
 - **Lazy `$HOME` expansion (F-03)** — when `BUSY_DIR` is the default, the command string embeds the literal `"$HOME/.local/state/goodnight/busy"` so it expands at hook-runtime in Claude's subshell, not at install-time in the installer's shell. Survives home-dir moves and differing-context invocations (cron, launchd, etc.).
 - **Path quoting (F-04)** — when `BUSY_DIR` is non-default, the absolute path is single-quoted with `'` escaping so `$` / whitespace / metacharacters in the path can't be interpreted by Claude's hook shell.
-- **`_managed_by: goodnight` tag** — applied to each hook entry so reinstalls / uninstalls target only goodnight's entries and preserve the user's other hooks.
+- **`# goodnight-hook` sentinel** — a trailing shell comment on every command. Inert at runtime; it is what makes an entry self-identifying. See "Hook detection" below.
+- **`_managed_by: goodnight` tag** — a sibling JSON key, kept for readability and as a secondary match.
 - **Backup before write** — existing `settings.json` is copied to `settings.json.bak.<timestamp>` before merging.
 
 Hook install opt-out: `SAC_SKIP_HOOK_INSTALL=1` (F-06) — installer announces clearly before touching `~/.claude/settings.json` and honors this env var for users who don't want automatic modification.
 
-Regression tests: `tests/hooks.bats`, `tests/hook-command-runtime.bats` (F-03 runtime test: spawns a fresh shell with an arbitrary `$HOME`, pipes a real `.session_id` blob on stdin, verifies the hook command string resolves correctly).
+Regression tests: `tests/hooks.bats`, `tests/hook-command-runtime.bats` (F-03 runtime test: spawns a fresh shell with an arbitrary `$HOME`, pipes a real `.session_id` blob on stdin, verifies the hook command string resolves correctly), `tests/hook-detection-resilience.bats`.
+
+### Hook detection (critical — this is what silently broke)
+
+`settings.json` is co-owned. Claude Code writes it, and so does every tool the user has wired into their setup. In September 2026 something rewrote Sam's file and dropped the `_managed_by` key while preserving the hook commands verbatim. `hooks_installed` matched on that key alone, concluded the hooks were gone, and `goodnight` fell back to `--watch-pid` — where it waited for an interactive Claude REPL to exit, i.e. until the 6h timeout, every night, with no error. The hooks were firing correctly the entire time; nothing was reading them.
+
+The rule that follows: **detection keys on the command string, not on annotations beside it.** A key we invented sitting next to keys Claude Code owns is fragile by construction; the command has to survive verbatim or the hook does not run at all.
+
+`HOOK_MATCH_JQ` defines the shared predicate — a hook entry is ours if any of its commands matches `goodnight-hook|goodnight/busy`, **or** it carries the `_managed_by` tag. It is used by detection, install de-duplication, uninstall, and repair alike, so those four can never disagree about what counts as ours.
+
+`HOOK_MATCH_JQ` defines **two** predicates, and the distinction matters:
+
+- `gn_functional` — does the entry still carry a command that does the job? This is what *health* asks. The tag alone is not enough: an entry whose command was emptied or replaced would otherwise report healthy, skip repair, and leave an active turn markerless for the watcher to sleep over. That is the original bug wearing the opposite mask.
+- `gn_owned` — is the entry ours to rewrite or remove? Broader on purpose, because a mangled entry we installed is still ours to clean up. Install de-duplication and uninstall use this one.
+
+`hooks_health` reports one word: `ok` (all three of `UserPromptSubmit`, `Stop`, `SessionEnd` functional), `partial`, `missing`, `nofile`, `badjson`, or `nojq`. `hooks_installed` is true only for `ok`. **SessionEnd counts toward health** so that an install predating it reports `partial`, routes through repair once, and comes out whole — otherwise an upgraded machine keeps leaking a marker on every quit or crash and never finds out. **`partial` must never count as installed** — without `UserPromptSubmit` no marker is ever written, so a marker-trusting watcher reads a busy machine as idle and sleeps it mid-task. Fail toward staying awake.
+
+`repair_claude_hooks` fixes a degraded install in place and runs automatically on the smart path (`--no-repair` opts out):
+
+- **untagged** → re-tag the existing entries. Never append; that is how a repair becomes a duplicate-hook bug.
+- **partial / missing** → full reinstall, which is idempotent because de-duplication matches the sentinel too.
+
+Note `jq` is required at *hook* runtime, not just ours — `nojq` is a health failure regardless of what the file says.
+
+Detection is verified against the real regression shape in `tests/hook-detection-resilience.bats`, including untagged entries, legacy entries with neither tag nor sentinel, partial installs, and the reinstall-does-not-duplicate case.
+
+## Session activity model
+
+Two independent signals decide whether an agent is still working. Both must be quiet before the Mac sleeps.
+
+1. **Busy markers** — hook-driven, precise, instant. Only as trustworthy as the hooks.
+2. **Agent session-log mtime** — every agent appends to its own session log as it works. Requires no cooperation, cannot be silently uninstalled, and covers sessions with no marker at all (background agents, sessions predating hook install, sessions whose hooks are broken).
+
+   `AGENT_ACTIVITY_DIRS` lists the roots scanned, defaulting to both:
+
+   | Agent | Log path |
+   |---|---|
+   | Claude Code | `~/.claude/projects/<slug>/<session_id>.jsonl` |
+   | Codex | `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl` |
+
+   Extend with `SAC_EXTRA_ACTIVITY_DIRS` (colon-separated) for any other agent that appends to a log as it works.
+
+   **Codex support is not a nicety.** Busy markers only ever describe Claude Code sessions, so a Claude-only watch will happily sleep the Mac on top of a running Codex job. "Wait until my agents are done" has to mean all of them, not just the ones that can write us a marker.
+
+Markers decide *which* sessions to care about; transcript mtime decides whether a marked session is genuinely alive. That pairing is the point:
+
+- `transcript_for_session <sid>` resolves `$CLAUDE_PROJECTS_DIR/*/<sid>.jsonl`.
+- `transcript_active_within <secs>` runs one `find … -mmin -N -print -quit` per root and returns on the first hit; early exit means cost does not scale with session-history size.
+- `newest_agent_activity` echoes the newest mtime across all roots (used by `--doctor`).
+- `reap_dead_markers` deletes any marker whose transcript has been silent past `SMART_STALE_MARKER_MINS` — a crash, a quit, or a session parked on a permission prompt. A marker with no transcript yet is spared until it ages out on its own mtime, so a prompt submitted a second ago is never reaped out from under a session about to start work.
+- `count_busy_sessions` reaps first, then counts what remains.
+
+Corroborating against transcripts is what allows the stale window to be **15 minutes** (`SAC_STALE_MARKER_MINUTES`) instead of the old blind **24 hours**. The old reaper deleted purely by marker age, so it had to be loose enough never to reap real work — which meant a crashed session pinned the machine awake for the rest of the day.
+
+Regression tests: `tests/session-activity.bats`.
 
 ## Smart-watch semantics
 
-`smart_watch_loop` fires sleep only when the enforced hook-state conditions hold:
+`smart_watch_loop` sleeps when **both** signals are quiet for `SMART_IDLE_SECONDS` (default 300, `--idle`), and is bounded by `SMART_TIMEOUT_SECS` (`--timeout`, default 6h) regardless.
 
-1. **Proof-of-life** — at least one busy marker has been observed since watch start OR one already exists at entry (F-01 cold-start guard — prevents premature-sleep when hooks aren't loaded in the running session yet).
-2. **Continuous idle** — busy count has been 0 for `SMART_IDLE_SECONDS` uninterrupted.
+Three deliberate departures from the previous behaviour, each fixing a way the machine failed to sleep:
 
-`--smart` relies on hook-based signals only; it does not enforce a separate live-process absence guard. If the user's Claude session pre-dates hook install (hooks not yet loaded), the loop warns via the spinner text ("Waiting for a Claude prompt…") and stays in cold mode indefinitely.
+- **No cold-start hold.** The old loop refused to sleep until it had personally witnessed a marker appear (the F-01 guard), so the most common invocation of all — every agent already finished before you type `goodnight` — waited forever. Starting quiet is now a valid path to sleep; the transcript check is what makes that safe.
+- **A hard timeout.** The old loop was `while true` with no elapsed check. `--timeout` bounded the PID path only, so one wedged marker meant the Mac never slept. Returns `2` on timeout; the caller sleeps anyway.
+- **Adaptive poll.** 5s while waiting, tightening to 1s only for the last 30s of the countdown, through `micro_sleep` (no fork per tick). The interval *is* the race window — a session that resumes just after a check is one we could sleep on top of — so it wants to be small at the moment we act and no smaller than necessary before that.
+- **Stands down if the Mac slept anyway.** `smart_watch_loop` samples `kern.sleeptime` at entry and each tick; if it moves, the machine slept by other means (lid, Apple menu, another tool) and the loop returns `3` and exits without sleeping. Without this the wall clock — which keeps running through a suspension — reads as elapsed watch time, so closing the lid at midnight and opening it at nine fires the timeout branch instantly and puts the machine straight back to sleep in the user's hands.
 
-Default-mode selection (lines ~1762–1781): if the user passes no explicit watch flag, `goodnight` picks `--smart` when `hooks_installed` returns true, otherwise `--watch-pid`. Early-exit modes (`--install-hooks`, `--uninstall-hooks`, `--preflight`, `--list`, `--log-summary`, `--sleep-now`) bypass the selection entirely.
+### Cost of the two signals
 
-Regression tests: `tests/smart-watch-semantics.bats` (F-01 + F-08 contract), `tests/smart-watch-runtime.bats` (drives the loop with a scripted `BUSY_DIR`), `tests/default-mode.bats` (selection logic).
+Marker counting is O(markers × project dirs) in `stat`s; the session-log scan is O(all transcripts) and those accumulate forever with no pruning. The scan is therefore the expensive half, and it is **skipped entirely whenever a marker already says busy** — its answer cannot change the outcome there. That confines the full traversal to the genuinely-idle case, where the loop is also polling lazily. `reap_dead_markers` uses `stat` and second arithmetic rather than `find -mmin`, which costs the same fork but makes the stale window mean exactly what it says instead of rounding to whole minutes.
+
+Default-mode selection: **smart, unconditionally**. Falling back to `--watch-pid` on a hook-detection failure is precisely what made the outage invisible — the command kept running, just uselessly. Smart mode repairs its own hooks and degrades to transcript-only detection if it cannot, so there is no failure PID mode needs to cover. `--pid`, `--wait-for-start`, and `--watch-pid` each select PID mode explicitly; without that, the smart default would silently ignore the flag the user just passed. Early-exit modes (`--install-hooks`, `--uninstall-hooks`, `--doctor`, `--preflight`, `--list`, `--log-summary`, `--sleep-now`) bypass selection entirely.
+
+Regression tests: `tests/smart-watch-semantics.bats` (source contracts), `tests/smart-watch-runtime.bats` (drives the loop), `tests/default-mode.bats` (selection + repair).
+
+### Known limitation: silent non-Claude tool calls
+
+An agent with no busy marker is judged purely on its session log. Claude Code sessions are safe here — a long tool call still holds a marker for the whole turn — but Codex has no marker, so a Codex tool call that runs longer than `--idle` (default 5m) without writing to its rollout log looks idle and the Mac may sleep under it.
+
+This is deliberately not papered over with a CPU-activity guard. An agent blocked on a network round trip burns no CPU while genuinely working, so CPU could only ever veto a sleep, never authorise one — and a veto that never clears is the failure this whole cycle was about. Raise `--idle` if it bites; the knob is the honest fix.
+
+## Verified sleep
+
+`pmset sleepnow` exits 0 whether or not the machine sleeps. When any process holds a `PreventSystemSleep` assertion macOS declines and pmset still reports success — so the old code printed "Good night", exited 0, and left the Mac awake all night with nothing in the log.
+
+`attempt_sleep` is now the only sleep path (`tests/smart-watch-semantics.bats` asserts no bare `pmset sleepnow` survives anywhere):
+
+1. Record `kern.sleeptime` — the kernel's last sleep-transition timestamp, which moves if and only if the machine actually slept.
+2. Issue `pmset sleepnow`, falling back to `osascript … sleep` if pmset itself errors.
+3. Wait `SLEEP_VERIFY_SECS` (12). If the Mac slept, execution simply stops here until it wakes.
+4. Confirm: `kern.sleeptime` advanced, or the wall clock jumped far past the wait (fallback when sysctl is unreadable).
+5. On refusal: re-scan assertions, log the holders by name and PID, release any caffeinate that has appeared since, back off, retry up to `SLEEP_MAX_ATTEMPTS` (3).
+
+Failure is loud — non-zero exit, a `SLEEP_FAILED` log line, and a notification.
+
+Regression tests: `tests/verified-sleep.bats` (shimmed `pmset` + `sysctl`; covers confirmed, refused, refused-then-succeeded, pmset-errors, and unreadable-sysctl paths).
+
+## `--doctor`
+
+One command that answers "will this work tonight?" without reading source. It exists because the failure that prompted this cycle was invisible from outside: hooks looked installed, markers were still being written, the command still ran.
+
+Reports hook health per event, re-tag need, marker counts (found / reaped / live), time since last agent output, effective watch configuration, sleep blockers, and power state — then a verdict of would-sleep / would-wait / degraded. **Exits non-zero when degraded**, so it works as a health check. It reaps stale markers as a side effect (that is cleanup, not diagnosis) but never sleeps the machine — asserted explicitly in `tests/doctor.bats`.
+
+## Unattended operation
+
+This command is started by someone who is about to stop watching it. Anything that can block indefinitely is a defect:
+
+- **Logging is on by default** (`--no-log` opts out), rotated at `LOG_MAX_BYTES` (2 MB) to `.log.1`. A run that takes an irreversible action while nobody is watching and leaves no evidence cannot be debugged the next morning.
+- **The update check is opt-in** (`--check-update`). It ends in a blocking y/N prompt; a command you start and walk away from must not stall on a question about itself. `SAC_SKIP_UPDATE_CHECK` remains a hard override so the post-update re-exec cannot loop when the replayed argv contains `--check-update` (F-05).
+- **Every prompt is time-bounded** by `PROMPT_TIMEOUT_SECS` (60) and resolves to its safe default. `gum confirm`/`gum choose` get `--timeout`; the plain fallback uses `read -t`.
+- **The blocker menu leads with the safe option**, because `gum choose --timeout` returns the *highlighted* element — putting "terminate the user's apps" first would auto-kill them on timeout.
+- **`--unattended`** declines every prompt outright.
+- **A failed blocker scan no longer aborts the run** under `--force` or `--unattended`. The scan is advisory; the sleep itself is verified and retried, so cancelling the night over a transient `pmset` failure is the worse outcome.
+- **Blockers no longer abort** when there is nobody to ask. Aborting guarantees the Mac stays awake; proceeding gets a verified, retried, logged attempt. That trade only became correct once sleep was verified.
+
+Regression tests: `tests/doctor.bats`, `tests/default-mode.bats`, `tests/terminal-ui.bats`.
 
 ## Preflight fail-closed contract
 
@@ -181,7 +285,8 @@ Every finding fixed in either audit cycle has at least one regression test that 
 
 ### What's not covered
 
-- The **real** `pmset sleepnow` call — would require actually sleeping the test machine or a Mach-level sleep mock that doesn't exist.
+- The **real** `pmset sleepnow` call — would require actually sleeping the test machine. The *verification and retry logic* around it is covered (`tests/verified-sleep.bats`) by shimming `pmset` and `sysctl`; what remains untested is only whether macOS itself honours the request.
+- **Real transcript writes by a live Claude session** — `tests/session-activity.bats` fabricates the `.jsonl` tree and backdates mtimes. The assumption that Claude appends to the transcript throughout a turn is verified by observation, not by test.
 - Network behavior of real `curl` against GitHub — tests use `file://` URLs and PATH-shimmed `curl` only.
 - The full installer end-to-end in piped mode — the TTY / stdin-pipe semantics are hard to simulate faithfully; individual pieces (size check, marker check, SHA pin, drain timeout, hook install, jq install) have isolated tests.
 
@@ -199,20 +304,22 @@ Linear top-to-bottom flow with labeled section banners (`# ── Section ──
 8. **Auto-start caffeinate -dim** (`ensure_caffeinate_running`) — launches a detached `caffeinate -dim` when none is already owned by `$USER`, so the Mac doesn't drift to sleep while we watch. Skippable with `--no-auto-caffeinate`.
 9. **Power-state gate** (`get_power_source`, `get_battery_percent`, `render_battery_gauge`, `wait_for_ac_power`) — blocks until AC is connected when on battery. See "Power-state gate" above.
 10. **Self-update check** (`check_for_update`) — see "Self-update check" above.
-11. **Claude Code hook integration** (`hooks_installed`, `install_claude_hooks`, `uninstall_claude_hooks`, `count_busy_sessions`, `smart_watch_loop`) — see "Claude Code hook integration" and "Smart-watch semantics" above.
+11. **Claude Code hook integration** (`HOOK_MATCH_JQ`, `hooks_health`, `hooks_installed`, `hooks_need_retag`, `repair_claude_hooks`, `install_claude_hooks`, `uninstall_claude_hooks`) — see "Claude Code hook integration" above. All four consumers share `HOOK_MATCH_JQ` so detection, install de-dup, uninstall, and repair cannot disagree about what counts as ours.
+    - **Session activity model** (`transcript_for_session`, `transcript_active_within`, `reap_dead_markers`, `count_busy_sessions`, `smart_watch_loop`) — see "Session activity model" and "Smart-watch semantics" above.
+    - **Verified sleep** (`sleep_stamp`, `wake_stamp`, `release_all_caffeinate`, `attempt_sleep`) — see "Verified sleep" above.
 12. **Argument parsing** — flag table lives inline in the `--help` block. Keep the `case` arms, the default-mode-selection block, and the `--help` text in sync when adding flags.
-13. **Default mode selection** — picks `--smart` (hooks installed) or `--watch-pid` (not installed) when neither was passed explicitly. See "Smart-watch semantics" above.
+13. **Default mode selection** — always `--smart`. PID mode is reachable only via `--pid` / `--wait-for-start` / `--watch-pid`, each of which sets it in its own flag arm. See "Smart-watch semantics" above.
 14. **FIFO setup + cleanup traps** — opens fd 9 on a named pipe so the watch loop can `read -t` instead of forking `/bin/sleep` every tick. EXIT trap releases the fd, removes the FIFO dir, and releases the concurrent-run lock (F-07). `on_interrupt` (INT/TERM/HUP) no longer calls `cleanup_fd_and_tmp` directly (F-12) — relies on the EXIT trap.
 15. **Concurrent-run lock** (`acquire_goodnight_lock`, `release_goodnight_lock`) — see "Concurrent-run lock (F-07)" above.
-16. **`--install-hooks` / `--uninstall-hooks` fast paths** — pure config-file operations; no preflight, no watch.
+16. **`--install-hooks` / `--uninstall-hooks` / `--doctor` fast paths** — pure config-file and diagnostic operations; no watch, no sleep. `--doctor` exits non-zero when the integration is degraded.
 17. **`--list` / `--preflight` / `--log-summary` modes** — early exits for introspection-only flows. `--log-summary` renders recent events + per-category counts as markdown via `glow` when available, plain text otherwise.
 18. **Actionable-path preamble** — `print_header` → `wait_for_ac_power` → `check_for_update`. Every path that might actually sleep the Mac goes through these in this order.
 19. **`--sleep-now` fast path** — skips Claude detection and the watch loop entirely. Runs preflight + blocker handling, releases existing caffeinate, then sleeps.
-20. **`--smart` mode** — hook-based watch. Requires `hooks_installed`; refuses and points at `--install-hooks` / `--watch-pid` otherwise. Runs preflight + blocker handling, acquires the lock, runs `smart_watch_loop`, then falls through to the release-caffeinate + sleep sequence by setting `SMART_WATCH_DONE=true`.
+20. **`--smart` mode** — the default watch. Checks `hooks_health`, self-repairs when degraded (unless `--no-repair`), and warns loudly + continues on transcript-only detection if repair fails; it never refuses to run. Reaps orphaned markers up front so the first tick reports a truthful count, runs preflight + blocker handling, acquires the lock, runs `smart_watch_loop`, then falls through to the release-caffeinate + sleep sequence by setting `SMART_WATCH_DONE=true`.
 21. **Detect Claude PID** — default watch mode when `TARGET_PID` isn't set by `--pid` or smart-mode. Honors `--wait-for-start`. On multi-match, watches the first and prints the rest with a hint to use `--pid`.
 22. **Pre-flight scan + verdict + optional confirmation** — runs on the default / `--watch-pid` path.
 23. **Watch loop** — polls the target PID until it exits or `--timeout` fires. PID-reuse detection (every 300 ticks / 30s) compares the **binary path only** (first whitespace token of `ps -p … -o command=`), not the full argv — argv mutation via `setproctitle` / `exec -a` must not trigger a false "reused" signal (F-10).
-24. **Release caffeinate + `pmset sleepnow`** — kill captured caffeinate PIDs (SIGTERM → SIGKILL fallback), respect `--dry-run` / `--caffeinate-only`, then `pmset sleepnow` with an `osascript … sleep` fallback.
+24. **Release caffeinate + verified sleep** — kill captured caffeinate PIDs (SIGTERM → SIGKILL fallback), respect `--dry-run` / `--caffeinate-only`, then hand off to `attempt_sleep`, which confirms against `kern.sleeptime` and retries. See "Verified sleep" above. Never call `pmset sleepnow` directly.
 
 When modifying behavior, identify which section owns the concern; most flags touch exactly one section.
 
@@ -225,7 +332,7 @@ When modifying behavior, identify which section owns the concern; most flags tou
 - Integer validation uses `is_integer` / `is_positive_integer`; reuse rather than inlining regex.
 - `printf` format strings used with dynamic data must be **static** (every dynamic value passes through `%s`) — stray `%` in battery percents, cmd names, etc. would otherwise corrupt the format. Search "Static format" in the source for the safety pattern.
 - `--json` output is consumed by automation; any new preflight field must be added to the JSON emitter **and** the human-readable renderer **and** the JSON-shape assertions in `tests/preflight-fail-closed.bats`.
-- `log_event` writes to `$LOG_FILE` only when `--log` is set. It warns to stderr **once per session** on first write failure (brace-grouped `{ echo ...; } 2>/dev/null` so bash's own redirection error is also suppressed). Subsequent failures stay silent to avoid spamming the watch loop. Event names are stable — `--log-summary` groups on them.
+- `log_event` writes to `$LOG_FILE` unless `--no-log` is passed (logging defaults ON — see "Unattended operation"). `maybe_rotate_log` runs once per invocation, not per event, since the tick loop calls `log_event` often. It warns to stderr **once per session** on first write failure (brace-grouped `{ echo ...; } 2>/dev/null` so bash's own redirection error is also suppressed). Subsequent failures stay silent to avoid spamming the watch loop. Event names are stable — `--log-summary` groups on them.
 
 ### Commenting standard
 
@@ -256,6 +363,32 @@ For editor experience, `bash-language-server` gives real-time shellcheck diagnos
 - On piped install (`curl | bash`), the installer drains its remaining stdin before exit with a bounded 5s timeout (F-11) to avoid `curl: (56)` cosmetic errors.
 
 ## Audit cycle history
+
+### 2026-09-10 (reliability cycle — silent-failure class)
+
+Triggered by a direct question — "is `goodnight` still working?" — whose honest answer was no, and had been for some time with no symptom anyone would notice. Every fix in this cycle targets the same class: **a failure that leaves the command apparently running.**
+
+Root cause: `hooks_installed` matched only on the `_managed_by` JSON key. Something rewrote `~/.claude/settings.json` and dropped it while preserving the hook commands. Detection reported "not installed", the default-mode selector silently demoted to `--watch-pid`, and the command spent every night waiting for an interactive Claude REPL to exit — reaching the 6h timeout instead of the intended idle detection. The hooks fired correctly throughout; nothing read them.
+
+Fixed:
+
+- **Detection follows the command, not annotations.** `HOOK_MATCH_JQ` matches a `# goodnight-hook` sentinel embedded in the command string, with the JSON tag as a secondary signal. Shared by detection, install de-dup, uninstall, and repair.
+- **Self-repair.** `hooks_health` classifies the failure; `repair_claude_hooks` re-tags in place or reinstalls. Runs automatically on the smart path.
+- **No silent demotion.** Smart mode is the unconditional default; it degrades loudly to transcript-only detection rather than switching to a mode that cannot work.
+- **Transcript-corroborated liveness.** Marker staleness is now checked against real session activity, letting the stale window drop from 24h to 15m — a crashed or prompt-blocked session no longer pins the Mac awake for a day.
+- **Cold-start hold removed.** "All agents already finished" — the most common invocation — used to wait forever.
+- **Hard timeout in the smart loop.** It was `while true`; `--timeout` bounded only the PID path.
+- **Verified sleep.** `pmset sleepnow` returns 0 even when macOS refuses. `attempt_sleep` confirms against `kern.sleeptime` and retries; failure is loud.
+- **Unattended by default.** Logging on, update check opt-in, every prompt time-bounded, blockers no longer abort when nobody is there to answer.
+- **`--doctor`.** The diagnostic that would have caught this from the outside on day one.
+
+Tests: 133 → 199. New files: `hook-detection-resilience.bats`, `session-activity.bats`, `verified-sleep.bats`, `doctor.bats`. Rewritten: `smart-watch-semantics.bats`, `smart-watch-runtime.bats`, `default-mode.bats`.
+
+**Deliberately broken contracts** (old tests asserted these; they were the bugs): the F-01 cold-start hold, the F-08 24-hour blind reaper, and PID-mode fallback on hook-detection failure. Each replaced by a test asserting the new contract rather than deleted.
+
+**Verified in production 2026-09-10.** The rebuilt command was left running unattended against a machine with a live Claude session and a 4h-old Codex run. It waited 3,442s for both to go quiet, released caffeinate, and confirmed sleep against `kern.sleeptime` on the first attempt — with two sleep blockers still recorded at the moment it asked. That last detail is the point: the previous code would have reported success there regardless.
+
+**Lesson for the next cycle:** the tests were green the whole time this was broken. They asserted that `hooks_installed` returned true for a *tagged* fixture — never that it survived a fixture whose tag had been stripped by someone else. When a component's correctness depends on data another program owns, the test has to model that program misbehaving.
 
 ### 2026-04-20 (PR #4 / PR #5 safety follow-up)
 

@@ -123,8 +123,8 @@ flowchart LR
   W --> U[Self-update check]
   P -->|No / AC| U
   U --> M{Hooks installed?}
-  M -->|Yes| S[--smart: watch busy markers]
-  M -->|No| D[--watch-pid: watch claude PID]
+  M -->|Yes| S[--smart: markers + transcript activity]
+  M -->|No| S2[--smart: transcript activity only]
   S --> C{Preflight clear?}
   D --> C
   C -->|Scan failed or blockers| E{User confirms?}
@@ -141,14 +141,14 @@ flowchart LR
 
 1. **Start goodnight.** You type `goodnight` in your terminal.
 2. **Pass the power check.** If you're on battery, goodnight shows a "please plug in" card and waits for the charger. Use `--allow-battery` to skip this gate.
-3. **Check for updates.** Once per 24 hours, goodnight compares the local script hash with the remote script and offers to update if they differ. Use `--skip-update-check` to skip this step.
-4. **Choose the watch mode.** If Claude Code hooks are installed, goodnight uses smart mode and watches the busy-marker directory populated by those hooks. Otherwise, it watches a specific `claude` PID.
+3. **Check for updates** — only when asked. `--check-update` compares the local script hash with the remote script and offers to update if they differ. Skipped by default so an unattended run can't stall on the prompt.
+4. **Choose the watch mode.** Smart mode, always. If the Claude Code hooks are missing or damaged, goodnight repairs them; if it can't, it falls back to watching agent transcript activity directly and says so. (`--pid`, `--wait-for-start`, and `--watch-pid` select legacy process-exit watching explicitly.)
 5. **Run preflight.** Goodnight checks whether anything else on your Mac would block sleep, such as backup jobs, screen sharing, or USB devices.
 6. **Acquire the lock.** If everything is clear, goodnight acquires a mutual-exclusion lock so two concurrent `goodnight` invocations cannot race.
-7. **Wait for Claude to finish.** Goodnight watches until all Claude sessions go idle in smart mode, or until the watched process exits in watch-pid mode.
+7. **Wait for every agent to finish.** Goodnight watches until no Claude session is busy *and* no agent — Claude Code or Codex — has written any output for `--idle` (default 5 minutes), then sleeps. A session that crashed or is parked on a permission prompt stops counting after `--stale` (default 15 minutes). A hard `--timeout` (default 6h) applies regardless.
 8. **Release keep-awake helpers.** Goodnight releases any `caffeinate` helpers it started.
 9. **Start sleep.** Goodnight issues `pmset sleepnow`.
-10. **Write the log.** If `--log` is enabled, the full sequence is written to `~/.local/state/sleep-after-claude.log`. Render it later with `goodnight --log-summary`.
+10. **Write the log.** The full sequence is written to `~/.local/state/sleep-after-claude.log` (on by default; `--no-log` opts out, and the file rotates at 2 MB). Render it later with `goodnight --log-summary`.
 
 ---
 
@@ -165,7 +165,9 @@ flowchart LR
 | **Sleep predictor** | macOS `pmset -g assertions` | Reads the OS's list of "things that want to stay awake" so we can predict whether sleep will succeed | Official Apple API, machine-parseable |
 | **Power gate** | macOS `pmset -g batt` | Waits for AC before spending battery on a long watch; shows a styled "plug me in" panel while waiting | Protects laptop battery without surprising the user |
 | **Sleep trigger** | macOS `pmset sleepnow` (with `osascript` fallback) | The command that actually puts the Mac to sleep | Official, supported, no flags or tricks |
-| **Self-update** | `curl` + `shasum` + `exec` | Once per 24h, compares local ↔ remote SHA-256 and re-execs into the new binary preserving argv | Fails open; never blocks offline users |
+| **Self-update** | `curl` + `shasum` + `exec` | On `--check-update`, compares local ↔ remote SHA-256 and re-execs into the new binary preserving argv | Fails open; never blocks offline users |
+| **Liveness** | Claude + Codex session-log mtimes | Detects agent activity without hooks, as a safety net under the hook-driven markers | Needs no cooperation from the agent and can't be silently uninstalled |
+| **Sleep verification** | `sysctl kern.sleeptime` | Confirms the Mac actually slept, since `pmset sleepnow` reports success either way | The only signal that moves if and only if the machine slept |
 | **Concurrent-run lock** | `mkdir`-as-atomic-lock at `~/.local/state/goodnight/lock` | Prevents two concurrent `goodnight` invocations from racing on caffeinate release and `pmset sleepnow` | macOS bash has no `flock`; `mkdir` is atomic across processes |
 | **Shell integration** | Your `~/.zshrc` or `~/.bash_profile` | Adds the `goodnight` alias + `~/bin` on `PATH` | Standard shell practice |
 | **Optional TUI polish** | [`gum`](https://github.com/charmbracelet/gum) / [`glow`](https://github.com/charmbracelet/glow) | Prettier confirm prompts, menus, panels, and markdown rendering when installed; silent fallback otherwise | Strictly optional — nothing breaks without them |
@@ -205,7 +207,7 @@ flowchart TB
   INST -->|writes| SAC
 ```
 
-Everything important happens locally on your Mac. goodnight has no telemetry, analytics, or server-side component. Network access is limited to installation, optional one-time `jq` download, and the once-per-24h self-update check unless you disable it with `--skip-update-check` / `SAC_SKIP_UPDATE_CHECK=1`.
+Everything important happens locally on your Mac. goodnight has no telemetry, analytics, or server-side component. Network access is limited to installation, an optional one-time `jq` download, and the self-update check — which is **off by default**; ask for it with `--check-update`.
 
 ---
 
@@ -231,7 +233,7 @@ Run:
 goodnight
 ```
 
-After the preflight gate clears, goodnight either watches Claude Code hook busy markers (`--smart`) or a concrete Claude PID (`--watch-pid`). Interactive terminals show a spinner; non-interactive output degrades to periodic plain status lines.
+After the preflight gate clears, goodnight watches both the Claude Code hook busy markers and agent transcript activity, and sleeps once both have been quiet for `--idle`. Interactive terminals show a spinner; non-interactive output degrades to periodic plain status lines.
 
 ### 🖼️ The completion path
 
@@ -253,8 +255,14 @@ Passing `--json` emits a machine-readable preflight report. The `scan_ok`, `can_
 
 #### 🎯 Core behavior
 
-- [x] **Smart-mode idle detection** — `--smart` (default when Claude Code hooks are installed) sleeps the Mac when every Claude session has returned to idle, not when the `claude` process exits. Works for interactive REPLs.
-- [x] **Process-exit watching** — `--watch-pid` (default when hooks aren't installed) sleeps when the `claude` process dies. Use for non-interactive Claude invocations.
+- [x] **Smart-mode idle detection** — the default. Sleeps when every Claude session has returned to idle, not when the `claude` process exits. Works for interactive REPLs.
+- [x] **Two independent liveness signals** — hook-written busy markers *and* agent session-log activity. Both must be quiet before the Mac sleeps, so a broken hook can't cause a premature sleep and a missing hook can't prevent one.
+- [x] **Watches Codex too, not just Claude Code** — busy markers only describe Claude sessions, so a Claude-only watch would sleep the Mac on top of a running Codex job. Both `~/.claude/projects` and `~/.codex/sessions` are scanned; add more with `SAC_EXTRA_ACTIVITY_DIRS`.
+- [x] **Self-repairing hooks** — a damaged `~/.claude/settings.json` integration is detected and fixed in place rather than silently disabling idle detection.
+- [x] **Verified sleep** — `pmset sleepnow` reports success even when macOS refuses. goodnight confirms against the kernel and retries, and tells you when it couldn't.
+- [x] **Stands down if you sleep the Mac yourself** — close the lid mid-watch and goodnight notices on wake and exits, instead of putting the machine straight back to sleep in your hands.
+- [x] **`--doctor`** — one command that reports whether the whole thing will actually work tonight. Exits non-zero when degraded, so it works as a health check.
+- [x] **Process-exit watching** — `--watch-pid` sleeps when the `claude` process dies. Use for non-interactive Claude invocations.
 - [x] **Sleep-now shortcut** — `--sleep-now` skips detection entirely: preflight + handle blockers + sleep immediately.
 - [x] **Auto-detect Claude Code process** — uses a two-tier `pgrep` scan that avoids false-positives from Electron-based apps.
 - [x] **Watch loop with low CPU usage** — uses Bash's built-in `read` with a FIFO to avoid forking `/bin/sleep` every tick.
@@ -285,23 +293,23 @@ Passing `--json` emits a machine-readable preflight report. The `scan_ok`, `can_
 
 #### 🔄 Self-update
 
-- [x] **Once-per-24h update check** — compares the local script's SHA-256 to the remote canonical script; prompts on mismatch.
+- [x] **Opt-in update check** — `--check-update` compares the local script's SHA-256 to the remote canonical script and prompts on mismatch. Off by default: it ends in a blocking prompt, and a command you start before walking away must not stall on a question about itself.
 - [x] **Exec-into-new-binary** — after an in-place update accepted mid-session, goodnight `exec`s the fresh script with your original arguments preserved.
 - [x] **Fails open** — offline, rate-limited, or non-TTY contexts silently skip; never blocks normal use.
-- [x] **Manual bypass / force** — `--skip-update-check` suppresses the check entirely; `--check-update` busts the 24h cache.
+- [x] **Manual control** — `--check-update` runs the check now and busts the 24h cache; `SAC_SKIP_UPDATE_CHECK=1` is a hard override that suppresses it even then.
 
 #### 🪝 Claude Code hook integration
 
 - [x] **Zero-touch installer** — `~/.claude/settings.json` is populated with `UserPromptSubmit` and `Stop` hooks during install (unless `SAC_SKIP_HOOK_INSTALL=1`).
 - [x] **Opt-out / manual install** — `goodnight --install-hooks` / `--uninstall-hooks` work at any time, idempotently. Existing user-defined hooks are preserved.
 - [x] **Survives home-dir moves** — hook command strings lazy-expand `$HOME` at hook-runtime, not at install-time.
-- [x] **Stale-marker reaper** — busy markers older than 24h (override via `SAC_STALE_MARKER_MINUTES`) are reaped automatically; short thresholds won't accidentally reap long-running Claude tasks.
+- [x] **Stale-marker reaper** — a busy marker is dropped once its session's transcript has been silent past `--stale` (default 15 minutes, override via `SAC_STALE_MARKER_MINUTES`). Because staleness is corroborated against real activity rather than the marker's own age, a long-running task is never reaped mid-work.
 
 #### 📢 Notifications & logging
 
 - [x] **macOS notification** — `--notify` displays a native notification when Claude finishes.
 - [x] **Completion sound** — plays `/System/Library/Sounds/Glass.aiff` on finish (`--no-sound` to disable).
-- [x] **Append-only log** — `--log` records every event to `~/.local/state/sleep-after-claude.log`.
+- [x] **Append-only log, on by default** — every event lands in `~/.local/state/sleep-after-claude.log`, rotated at 2 MB. A command that sleeps your Mac while you're asleep should never leave you with nothing to read in the morning. `--no-log` opts out.
 - [x] **Custom log path** — `--log-file <path>` redirects events elsewhere.
 - [x] **Pretty log summary** — `--log-summary` groups events by category and renders via `glow` (falls back to plain text).
 - [x] **Warn-once on log-write failure** — you'll see a stderr warning the first time logging breaks, then silent.
@@ -367,7 +375,7 @@ curl -fsSL https://raw.githubusercontent.com/sambatia/sleep-after-claude/main/in
 4. Extracts the `sleep-after-claude` program into `~/bin/sleep-after-claude`.
 5. Adds a `goodnight` alias to your shell's config file (`~/.zshrc` or `~/.bash_profile`) and makes sure `~/bin` is on your `PATH`.
 6. Auto-installs `jq` into `~/bin/jq` if it isn't already on your machine (SHA-pinned, so a tampered mirror is refused).
-7. Installs Claude Code hooks into `~/.claude/settings.json` so `--smart` idle detection works on first run. Skip this step with `SAC_SKIP_HOOK_INSTALL=1`.
+7. Installs Claude Code hooks into `~/.claude/settings.json` so `--smart` idle detection works on first run. Skip this step with `SAC_SKIP_HOOK_INSTALL=1`. (goodnight re-checks and repairs these on every run.)
 8. Runs a quick health check to make sure the install worked.
 
 When it finishes, you'll see: **"Installation complete 🌙"**.
@@ -393,8 +401,11 @@ goodnight needs zero configuration for normal use. These are optional knobs:
 | `SLEEP_AFTER_CLAUDE_UPDATE_URL` | No | Override the self-update source URL (same format as installer URL) | main-branch raw URL |
 | `SAC_JQ_SHA256` | No | Override the expected SHA-256 for the auto-installed `jq` binary (for legitimate jq re-releases) | 64-hex hash |
 | `SAC_SKIP_HOOK_INSTALL` | No | Set to `1` to tell the installer not to modify `~/.claude/settings.json` | `1` |
-| `SAC_SKIP_UPDATE_CHECK` | No | Set to `1` to tell the tool not to check for updates on startup (equivalent to `--skip-update-check`) | `1` |
-| `SAC_STALE_MARKER_MINUTES` | No | Override the stale-marker reaper threshold in `--smart` mode (default 1440 = 24h) | `720` |
+| `SAC_SKIP_UPDATE_CHECK` | No | Hard override that suppresses the update check even when `--check-update` is passed | `1` |
+| `SAC_STALE_MARKER_MINUTES` | No | Minutes of transcript silence before a session stops counting as busy (default 15) | `30` |
+| `SAC_IDLE_SECONDS` | No | Quiet period required before sleeping (default 300) | `600` |
+| `SAC_SLEEP_MAX_ATTEMPTS` | No | Sleep attempts before reporting failure (default 3) | `5` |
+| `SAC_EXTRA_ACTIVITY_DIRS` | No | Extra colon-separated roots to scan for agent session logs | `~/.myagent/logs` |
 | `SAC_NO_GUM` / `SAC_FORCE_GUM` | No | Force-off / force-on the `gum` TUI integration | `1` |
 | `SAC_NO_GLOW` | No | Force-off the `glow` markdown-rendering integration | `1` |
 
@@ -419,9 +430,11 @@ Close your laptop lid, walk away, go to bed. When Claude finishes, the Mac sleep
 ### Useful variants
 
 ```bash
-goodnight                      # Smart mode (if hooks are installed) or PID-watch (if not)
-goodnight --smart              # Force smart mode (fails if hooks aren't installed)
-goodnight --watch-pid          # Force legacy PID-exit watching
+goodnight                      # Smart mode — wait for every agent, then sleep
+goodnight --doctor             # Is this actually going to work tonight?
+goodnight --idle 600           # Require 10 minutes of quiet instead of 5
+goodnight --unattended         # Never prompt; every question takes its safe default
+goodnight --watch-pid          # Legacy PID-exit watching
 goodnight --sleep-now          # Skip the watch — preflight + sleep immediately
 goodnight --preflight          # Just audit your system, don't watch or sleep
 goodnight --dry-run            # Watch and detect, but don't actually sleep
@@ -473,7 +486,7 @@ You set `SLEEP_AFTER_CLAUDE_INSTALLER_SHA256` but the downloaded installer doesn
 
 **Mac doesn't actually sleep after Claude finishes**
 
-Check `~/.local/state/sleep-after-claude.log` (if you ran with `--log`) for a `SLEEP_FAILED` entry. Re-run with `--preflight` to see the current blocker list — the most common cause is a background app (Zoom, Discord, backup) acquiring a sleep assertion after goodnight started watching.
+Check `~/.local/state/sleep-after-claude.log` for a `SLEEP_FAILED` entry — it names the processes that held the sleep assertion across all retries. Re-run with `--preflight` to see the current blocker list — the most common cause is a background app (Zoom, Discord, backup) acquiring a sleep assertion after goodnight started watching.
 
 ---
 
@@ -487,15 +500,27 @@ alias goodnight "$HOME/bin/sleep-after-claude"
 
 ---
 
-**"--smart mode can't detect idle sessions"**
+**"Running without Claude hook markers"**
 
-You ran `goodnight --smart` but the Claude Code hooks aren't installed in `~/.claude/settings.json`. Run `goodnight --install-hooks` once, then restart any open Claude Code sessions so they pick up the new hooks. Alternatively, use `goodnight --watch-pid` to fall back to process-exit watching.
+goodnight couldn't repair the hooks in `~/.claude/settings.json` — usually because `jq` isn't on `PATH`. It falls back to watching agent transcript activity, which still works but notices a finished turn less promptly. Run `goodnight --doctor` for the specific reason, then `brew install jq && goodnight --install-hooks` if that's the cause.
+
+Note that repaired hooks only apply to Claude Code sessions started *afterwards* — a session already running has its hook config loaded.
 
 ---
 
-**"Waiting for a Claude prompt…" in --smart mode and it never proceeds**
+**It slept while an agent was still working**
 
-Your Claude Code session started before the hooks were installed, so it isn't emitting busy markers. Quit and restart the session, or use `--watch-pid` / `--sleep-now` for this invocation.
+Agents without a busy marker — Codex, chiefly — are judged purely on their session log. A tool call that runs longer than `--idle` (default 5 minutes) without writing anything looks idle. Raise it for long jobs:
+
+```bash
+goodnight --idle 1800        # half an hour of quiet required
+```
+
+Claude Code sessions aren't affected: a long tool call holds its busy marker for the whole turn.
+
+**goodnight is waiting and I don't know what for**
+
+Run `goodnight --doctor` in another terminal. It reports how many sessions are still marked busy, how long ago any agent last wrote output, and what's holding sleep. A session that has genuinely stalled stops counting after `--stale` minutes.
 
 ---
 
@@ -513,7 +538,7 @@ goodnight waits for AC power by default to protect your laptop battery. Pass `--
 
 **goodnight wants to update mid-session and you don't want it to**
 
-Pass `--skip-update-check`, or set `SAC_SKIP_UPDATE_CHECK=1` in your environment.
+Nothing — the update check is off by default. It only runs when you pass `--check-update`, and `SAC_SKIP_UPDATE_CHECK=1` suppresses it even then.
 
 </details>
 
@@ -563,11 +588,16 @@ goodnight/
 
 If you're looking for the command-line flags (goodnight's equivalent of an API), they are:
 
-**Watch modes** (default selection: `--smart` when Claude Code hooks are installed, `--watch-pid` otherwise)
+**Watch modes** (`--smart` is always the default; the others must be asked for by name)
 
 | Flag | Short | Description |
 |---|---|---|
-| `--smart` | — | Hook-based idle detection — sleep when all Claude sessions have returned to idle. Requires `--install-hooks` to have been run once. |
+| `--smart` | — | Idle-aware watch (the default). Sleeps when no session is busy and no agent has written output for `--idle`. |
+| `--idle <secs>` | `300` | Quiet period required before sleeping. |
+| `--stale <mins>` | `15` | Transcript silence after which a session stops counting as busy. |
+| `--unattended` | — | Never prompt; every question resolves to its safe default. |
+| `--doctor` | — | Report live health of the whole integration, then exit. Non-zero when degraded. |
+| `--no-repair` | — | Don't auto-repair degraded Claude Code hooks. |
 | `--watch-pid` | — | Legacy process-exit watching — sleep when the `claude` process dies. Use when running Claude non-interactively. |
 | `--sleep-now` | — | Skip the watch entirely. Preflight + handle blockers + sleep immediately. |
 
@@ -588,7 +618,7 @@ If you're looking for the command-line flags (goodnight's equivalent of an API),
 
 | Flag | Short | Description |
 |---|---|---|
-| `--install-hooks` | — | Install Claude Code hooks into `~/.claude/settings.json` so `--smart` can detect idle sessions |
+| `--install-hooks` | — | Install or repair the Claude Code hooks in `~/.claude/settings.json` |
 | `--uninstall-hooks` | — | Remove goodnight's Claude Code hooks, leaving any user-defined hooks in place |
 
 **Inspection & output**
@@ -604,10 +634,11 @@ If you're looking for the command-line flags (goodnight's equivalent of an API),
 | `--json` | — | Emit preflight as JSON |
 | `--no-sound` | — | Skip the completion sound |
 | `--notify` | `-n` | Send a macOS notification when done |
-| `--log` | — | Write events to the log file |
+| `--log` | — | Write events to the log file (already the default) |
 | `--log-file <path>` | — | Custom log path (implies `--log`) |
 | `--check-update` | — | Force an immediate update check (bypasses the 24h cache) |
-| `--skip-update-check` | — | Don't check for a newer version on startup |
+| `--skip-update-check` | — | Accepted for compatibility; the check is already off by default |
+| `--no-log` | — | Disable logging for this run (logging is on by default) |
 | `--help` | `-h` | Show help and exit |
 
 ### JSON output schema

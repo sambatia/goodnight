@@ -1,93 +1,98 @@
 #!/usr/bin/env bats
-# Default-mode selection: --smart when hooks are installed,
-# --watch-pid otherwise.
+# Default-mode selection. Smart mode is now the unconditional default;
+# PID mode is opt-in. The old behaviour — silently demoting to PID mode
+# whenever hook detection failed — is the bug that let a broken
+# integration masquerade as a working command for months.
 
 load 'lib/common'
 
 setup() {
   setup_sandbox
+  export CLAUDE_SETTINGS_FILE="$HOME/.claude/settings.json"
 }
 
-@test "default mode: --smart when hooks are installed and it fails cleanly without Claude processes" {
-  # Install hooks first
-  bash "$REPO_ROOT/sleep-after-claude" --install-hooks >/dev/null
-  # Now run goodnight with no args — should pick smart mode. Since no
-  # Claude sessions exist and the busy dir is empty, smart mode
-  # proceeds to sleep after its idle threshold — which we can't let
-  # happen in a test. Instead, use --preflight which bypasses watch
-  # mode entirely but still goes through the default-mode selector.
-  # Simpler: check that --smart is implicitly selected by inspecting
-  # --help's description of the default.
-  run grep -F 'default when hooks are installed' "$REPO_ROOT/sleep-after-claude"
+@test "default mode: smart is selected with no flags, hooks or not" {
+  block="$(sed -n '/^if \[\[ "\$SMART_WATCH" != true \&\& "\$WATCH_PID_MODE" != true \&\&/,/^fi$/p' \
+    "$REPO_ROOT/sleep-after-claude")"
+  assert_contains "$block" "SMART_WATCH=true"
+  assert_not_contains "$block" "hooks_installed"
+}
+
+@test "--smart repairs missing hooks instead of refusing to run" {
+  # Previously this exited 1 with "hooks aren't installed" and did
+  # nothing. Refusing to work is not a useful response to a repairable
+  # config problem in a command you rely on nightly.
+  [ ! -f "$CLAUDE_SETTINGS_FILE" ]
+  shim pgrep 'exit 1'
+
+  run env SAC_IDLE_SECONDS=1 bash "$REPO_ROOT/sleep-after-claude" \
+    --smart --no-preflight --allow-battery --dry-run \
+    --no-auto-caffeinate --no-sound --no-log
+
   [ "$status" -eq 0 ]
+  assert_contains "$output" "repair"
+  assert_contains "$output" "Dry run complete"
+  # And the repair actually landed.
+  run jq -r '[.hooks.UserPromptSubmit[], .hooks.Stop[]] | length' "$CLAUDE_SETTINGS_FILE"
+  [ "$output" = "2" ]
 }
 
-@test "--smart exits with guidance when hooks are NOT installed" {
-  run bash "$REPO_ROOT/sleep-after-claude" --smart
-  [ "$status" -eq 1 ]
-  assert_contains "$output" "hooks aren't installed"
-  assert_contains "$output" "--install-hooks"
-  assert_contains "$output" "--watch-pid"
+@test "--smart with --no-repair falls back instead of repairing" {
+  [ ! -f "$CLAUDE_SETTINGS_FILE" ]
+  shim pgrep 'exit 1'
+
+  run env SAC_IDLE_SECONDS=1 bash "$REPO_ROOT/sleep-after-claude" \
+    --smart --no-preflight --allow-battery --dry-run --no-repair \
+    --no-auto-caffeinate --no-sound --no-log
+
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "transcript-activity detection"
+  [ ! -f "$CLAUDE_SETTINGS_FILE" ]
 }
 
 @test "hooks_installed: true after --install-hooks, false after --uninstall-hooks" {
-  # Source the helper in isolation
-  sed -n '/^hooks_installed() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude" \
-    >"$BATS_TEST_TMPDIR/helper.sh"
+  extract_from_script "$BATS_TEST_TMPDIR/helper.sh" hooks_health hooks_installed
 
-  export CLAUDE_SETTINGS_FILE="$HOME/.claude/settings.json"
-  # Not installed yet
-  run bash -c "CLAUDE_SETTINGS_FILE='$CLAUDE_SETTINGS_FILE'; source '$BATS_TEST_TMPDIR/helper.sh'; hooks_installed && echo YES || echo NO"
+  probe() {
+    bash -c "CLAUDE_SETTINGS_FILE='$CLAUDE_SETTINGS_FILE'; source '$BATS_TEST_TMPDIR/helper.sh'; hooks_installed && echo YES || echo NO"
+  }
+
+  run probe
   [ "$output" = "NO" ]
-  # After install
   bash "$REPO_ROOT/sleep-after-claude" --install-hooks >/dev/null
-  run bash -c "CLAUDE_SETTINGS_FILE='$CLAUDE_SETTINGS_FILE'; source '$BATS_TEST_TMPDIR/helper.sh'; hooks_installed && echo YES || echo NO"
+  run probe
   [ "$output" = "YES" ]
-  # After uninstall
   bash "$REPO_ROOT/sleep-after-claude" --uninstall-hooks >/dev/null
-  run bash -c "CLAUDE_SETTINGS_FILE='$CLAUDE_SETTINGS_FILE'; source '$BATS_TEST_TMPDIR/helper.sh'; hooks_installed && echo YES || echo NO"
+  run probe
   [ "$output" = "NO" ]
 }
 
 @test "F-04: hooks_installed is false without jq even when marker text exists" {
-  sed -n '/^hooks_installed() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude" \
-    >"$BATS_TEST_TMPDIR/helper.sh"
+  extract_from_script "$BATS_TEST_TMPDIR/helper.sh" hooks_health hooks_installed
 
-  mkdir -p "$(dirname "$HOME/.claude/settings.json")"
-  cat >"$HOME/.claude/settings.json" <<'JSON'
-{
-  "hooks": {
-    "Stop": [
-      { "_managed_by": "goodnight" }
-    ]
-  }
-}
+  mkdir -p "$(dirname "$CLAUDE_SETTINGS_FILE")"
+  cat >"$CLAUDE_SETTINGS_FILE" <<'JSON'
+{ "hooks": { "Stop": [ { "_managed_by": "goodnight" } ] } }
 JSON
   mkdir -p "$BATS_TEST_TMPDIR/empty-path"
 
   run bash -c "
     PATH='$BATS_TEST_TMPDIR/empty-path'
-    CLAUDE_SETTINGS_FILE='$HOME/.claude/settings.json'
+    CLAUDE_SETTINGS_FILE='$CLAUDE_SETTINGS_FILE'
     source '$BATS_TEST_TMPDIR/helper.sh'
     hooks_installed && echo YES || echo NO
   "
-
   [ "$output" = "NO" ]
 }
 
 @test "installer: runs --install-hooks automatically during install" {
-  # Fresh sandbox
-  unset HOME_BAK
-  # The common setup gave us a HOME; use it.
   SHELL=/bin/zsh run bash "$REPO_ROOT/install-sleep-after-claude.sh"
   [ "$status" -eq 0 ]
   assert_contains "$output" "Claude Code hooks installed"
-  [ -f "$HOME/.claude/settings.json" ]
-  # The installed binary must be callable
+  [ -f "$CLAUDE_SETTINGS_FILE" ]
   [ -x "$HOME/bin/sleep-after-claude" ]
-  # Hooks must be present
   run jq -r '.hooks.Stop | map(select(._managed_by == "goodnight")) | length' \
-    "$HOME/.claude/settings.json"
+    "$CLAUDE_SETTINGS_FILE"
   [ "$output" = "1" ]
 }
 

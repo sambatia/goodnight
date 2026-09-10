@@ -13,7 +13,8 @@ setup() {
   [ "$status" -eq 0 ]
   assert_contains "$output" "# sleep-after-claude"
   assert_contains "$output" "## Watch options"
-  assert_contains "$output" "default when hooks are installed"
+  assert_contains "$output" "## How it decides"
+  assert_contains "$output" "--doctor"
 }
 
 @test "terminal-ui: ui_confirm fails closed without stdin TTY" {

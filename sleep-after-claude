@@ -74,7 +74,11 @@ CAFFEINATE_ONLY=false
 DRY_RUN=false
 LIST_MODE=false
 NOTIFY=false
-LOG_ENABLED=false
+# Logging defaults ON. This is an unattended command that takes an
+# irreversible action while nobody is watching; a run that leaves no
+# evidence behind cannot be debugged the next morning. --no-log opts
+# out. The log is size-capped (see LOG_MAX_BYTES).
+LOG_ENABLED=true
 WAIT_FOR_START=false
 LOG_FILE="${HOME}/.local/state/sleep-after-claude.log"
 FIFO_DIR=""
@@ -83,8 +87,18 @@ SKIP_PREFLIGHT=false
 FORCE=false
 BRIEF=false
 JSON_OUTPUT=false
-SKIP_UPDATE_CHECK="${SAC_SKIP_UPDATE_CHECK:+true}"
-SKIP_UPDATE_CHECK="${SKIP_UPDATE_CHECK:-false}"
+# The update check is opt-in. It ends in a blocking y/N prompt, and a
+# command whose whole purpose is to be started and walked away from
+# must not be able to stall on a question about itself. `--check-update`
+# asks for it explicitly; `update-all` and friends handle routine
+# upgrades out of band.
+SKIP_UPDATE_CHECK=true
+# SAC_SKIP_UPDATE_CHECK is a hard override rather than merely another
+# default: the post-update re-exec replays the user's original argv,
+# which may well contain --check-update, and without a suppressor that
+# would re-enter the update check forever (F-05).
+SKIP_UPDATE_CHECK_FORCED="${SAC_SKIP_UPDATE_CHECK:+true}"
+SKIP_UPDATE_CHECK_FORCED="${SKIP_UPDATE_CHECK_FORCED:-false}"
 NO_AUTO_CAFFEINATE=false
 ALLOW_BATTERY=false
 LOG_SUMMARY=false
@@ -95,13 +109,77 @@ INSTALL_HOOKS=false
 UNINSTALL_HOOKS=false
 CLAUDE_SETTINGS_FILE="${HOME}/.claude/settings.json"
 BUSY_DIR="${HOME}/.local/state/goodnight/busy"
-SMART_IDLE_SECONDS=30 # how long all sessions must be idle before sleep
-# Stale-marker threshold in minutes. A busy marker older than this is
-# assumed to belong to a crashed Claude session. Default 24h — tight
-# enough to reap genuinely-dead sessions eventually, loose enough that
-# a legitimately long-running task (large migration, agentic run)
-# doesn't get reaped mid-work. Override with SAC_STALE_MARKER_MINUTES.
-SMART_STALE_MARKER_MINS="${SAC_STALE_MARKER_MINUTES:-1440}"
+
+# Where Claude Code stores per-session transcripts:
+#   $CLAUDE_PROJECTS_DIR/<project-slug>/<session_id>.jsonl
+# Claude appends to the transcript continuously while a session works,
+# which makes its mtime the single most reliable "this agent is alive
+# and doing something" signal available without cooperation from the
+# session itself. Everything in smart mode is built on it.
+CLAUDE_PROJECTS_DIR="${SAC_CLAUDE_PROJECTS_DIR:-${HOME}/.claude/projects}"
+
+# Codex keeps the equivalent record at
+#   $CODEX_SESSIONS_DIR/YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl
+# and appends to it as the session works, exactly like Claude's
+# transcripts.
+CODEX_SESSIONS_DIR="${SAC_CODEX_SESSIONS_DIR:-${HOME}/.codex/sessions}"
+
+# Every root scanned for agent activity. Busy markers only ever describe
+# Claude Code sessions, so without this the machine would happily sleep
+# on top of a working Codex run — "wait until my agents are done" has to
+# mean all of them, not just the ones that can write us a marker.
+#
+# Extend with SAC_EXTRA_ACTIVITY_DIRS (colon-separated) for any other
+# agent that keeps an append-as-it-works log.
+AGENT_ACTIVITY_DIRS=("$CLAUDE_PROJECTS_DIR" "$CODEX_SESSIONS_DIR")
+if [[ -n "${SAC_EXTRA_ACTIVITY_DIRS:-}" ]]; then
+  while IFS= read -r _extra_dir; do
+    [[ -n "$_extra_dir" ]] && AGENT_ACTIVITY_DIRS+=("$_extra_dir")
+  done <<<"${SAC_EXTRA_ACTIVITY_DIRS//:/$'\n'}"
+fi
+
+# How long every tracked session must be quiet before we sleep.
+# Default 5 minutes: long enough that a brief gap between turns (or a
+# slow tool call that outlives its transcript write) doesn't trip the
+# countdown, short enough to be useful as a nightly command.
+SMART_IDLE_SECONDS="${SAC_IDLE_SECONDS:-300}"
+
+# A busy marker whose session transcript hasn't been written for this
+# many minutes is treated as dead weight — a crashed session, a session
+# parked on a permission prompt, or one whose Stop hook never fired.
+# Such a marker no longer blocks sleep and is reaped on sight.
+#
+# Because staleness is now corroborated against real transcript
+# activity (rather than the marker's own mtime alone) this can be far
+# tighter than the old blind 24h reaper without risking a reap
+# mid-work. Override with SAC_STALE_MARKER_MINUTES.
+SMART_STALE_MARKER_MINS="${SAC_STALE_MARKER_MINUTES:-15}"
+
+# Sentinel embedded in every hook command goodnight installs. Unlike a
+# sibling JSON key (._managed_by), a substring of the command string
+# itself survives every settings.json rewrite we have observed in the
+# wild — editors, installers, and Claude Code's own config merges all
+# preserve the command verbatim while freely dropping unknown keys.
+# Hook detection keys on this first and the JSON tag second.
+HOOK_SENTINEL="goodnight-hook"
+
+# Verified-sleep tuning. pmset returns 0 even when an assertion blocks
+# the sleep, so a single call proves nothing; we confirm afterwards and
+# retry. See attempt_sleep().
+SLEEP_MAX_ATTEMPTS="${SAC_SLEEP_MAX_ATTEMPTS:-3}"
+SLEEP_VERIFY_SECS="${SAC_SLEEP_VERIFY_SECS:-12}"
+SLEEP_RETRY_BACKOFF_SECS="${SAC_SLEEP_RETRY_BACKOFF_SECS:-5}"
+
+UNATTENDED=false
+NO_REPAIR=false
+DOCTOR_MODE=false
+# Seconds an interactive prompt may block before it self-answers with
+# the safe default. Guarantees an unattended `goodnight` can never hang
+# on a question nobody is awake to answer.
+PROMPT_TIMEOUT_SECS="${SAC_PROMPT_TIMEOUT_SECS:-60}"
+# Rotate the log once it passes this size so an unattended nightly
+# command can't grow it without bound.
+LOG_MAX_BYTES="${SAC_LOG_MAX_BYTES:-2097152}"
 UPDATE_CHECK_URL="${SLEEP_AFTER_CLAUDE_UPDATE_URL:-https://raw.githubusercontent.com/sambatia/sleep-after-claude/main/sleep-after-claude}"
 UPDATE_INSTALLER_URL="${SLEEP_AFTER_CLAUDE_INSTALLER_URL:-https://raw.githubusercontent.com/sambatia/sleep-after-claude/main/install-sleep-after-claude.sh}"
 UPDATE_CACHE_DIR="${HOME}/.cache/sleep-after-claude"
@@ -330,13 +408,19 @@ ui_panel() {
 # Usage: ui_confirm "Proceed anyway?"   (returns 0 on yes, 1 on no)
 ui_confirm() {
   local prompt="$1"
+  if [[ "$UNATTENDED" == true ]]; then
+    print_warn "Unattended mode — declining: $prompt"
+    return 1
+  fi
   if [[ "$STDIN_IS_TTY" != true ]]; then
     print_warn "Non-interactive confirmation unavailable — defaulting to no: $prompt"
     return 1
   fi
   if have_gum; then
-    # --default=false means Enter selects No (safe default).
-    gum confirm --default=false "$prompt"
+    # --default=false means Enter selects No (safe default). --timeout
+    # guarantees the prompt cannot outlive the person who started the
+    # command and walked away.
+    gum confirm --default=false --timeout "${PROMPT_TIMEOUT_SECS}s" "$prompt"
     return $?
   fi
   prompt_confirm "${BOLD}${prompt}${RESET} [y/N]:"
@@ -352,14 +436,33 @@ ui_choose() {
   local header="$1"
   shift
   local -a items=("$@")
+  if [[ "$UNATTENDED" == true || "$STDIN_IS_TTY" != true ]]; then
+    # No one to ask. Callers treat an empty result as "take the safe
+    # default" rather than blocking on a menu nobody will answer.
+    return 1
+  fi
+  # The first entry is the documented safe default, and it is what an
+  # unanswered prompt must resolve to. Callers order their menus so
+  # that this is the non-destructive choice.
+  local safe_default="${items[0]%%|*}"
   if have_gum; then
     local -a labels=()
     local item
     for item in "${items[@]}"; do
       labels+=("${item#*|}")
     done
-    local chosen_label
-    chosen_label="$(gum choose --header "$header" -- "${labels[@]}")" || return 130
+    local chosen_label rc
+    chosen_label="$(gum choose --header "$header" --timeout "${PROMPT_TIMEOUT_SECS}s" -- "${labels[@]}")"
+    rc=$?
+    # gum exits 124 on timeout. Passing that through as a failure threw
+    # the safe default away and handed the caller an empty answer, which
+    # it reads as abort — so a prompt left unattended kept the Mac awake,
+    # which is precisely what the timeout was added to prevent.
+    if ((rc == 124)); then
+      echo "$safe_default"
+      return 0
+    fi
+    ((rc == 0)) || return 130
     # Map label back to key
     for item in "${items[@]}"; do
       if [[ "${item#*|}" == "$chosen_label" ]]; then
@@ -370,15 +473,29 @@ ui_choose() {
     return 1
   fi
   # Fallback: render labels + read a single-letter key.
+  #
+  # Every byte of prompt UI goes to stderr. This function's stdout is
+  # command-substituted by the caller, so the menu itself was being
+  # captured as part of the answer — the header and labels came back
+  # glued to the chosen key, matched no case arm, and the blocker menu
+  # aborted whatever the user picked.
   local item
-  echo "  $header"
+  echo "  $header" >&2
   for item in "${items[@]}"; do
     local key="${item%%|*}" label="${item#*|}"
-    echo -e "    ${CYAN}[${key:0:1}]${RESET} ${label}"
+    echo -e "    ${CYAN}[${key:0:1}]${RESET} ${label}" >&2
   done
   local choice
-  printf "  Choice: "
-  read -r choice
+  printf "  Choice: " >&2
+  # Bounded here too. Without gum installed this read was unbounded, so
+  # the time-bounded-prompt contract held only on machines that happened
+  # to have gum.
+  if ! read -r -t "$PROMPT_TIMEOUT_SECS" choice; then
+    echo "" >&2
+    print_warn "No answer in ${PROMPT_TIMEOUT_SECS}s — taking the safe default." >&2
+    echo "$safe_default"
+    return 0
+  fi
   choice="$(echo "$choice" | tr '[:upper:]' '[:lower:]' | cut -c1)"
   for item in "${items[@]}"; do
     local key="${item%%|*}"
@@ -412,7 +529,7 @@ usage() {
   ui_markdown <<'HELP'
 # sleep-after-claude
 
-Sleep your Mac when Claude Code finishes.
+Sleep your Mac once every agent has finished, paused, or gone quiet.
 
 ## Usage
 
@@ -420,34 +537,57 @@ Sleep your Mac when Claude Code finishes.
 sleep-after-claude [options]
 ```
 
+## How it decides
+
+Two independent signals must agree before the Mac sleeps:
+
+- **Busy markers** — written by Claude Code hooks on every prompt,
+  removed when the turn ends. Precise, but only as good as the hooks.
+- **Transcript activity** — Claude appends to
+  `~/.claude/projects/*/<session>.jsonl` while it works. Needs no
+  hooks, so it still catches work when the hooks are broken or absent.
+
+A session whose transcript has been silent past `--stale` no longer
+counts as busy — that covers a crash, a quit, and a session parked on
+a permission prompt. Sleep is then verified against the kernel and
+retried, because `pmset sleepnow` reports success even when macOS
+refuses.
+
+Run `--doctor` to see all of this as live state.
+
 ## Watch options
 
 | Flag | Description |
 |---|---|
-| `--pid, -p <pid>` | Watch a specific PID (default: auto-detect). |
-| `--timeout, -t <hrs>` | Force sleep after N hours, min 1 (default: 6). |
+| `--idle <secs>` | Quiet period required before sleeping (default: 300). |
+| `--stale <mins>` | Silence after which a session stops counting (default: 15). |
+| `--timeout, -t <hrs>` | Sleep regardless after N hours, min 1 (default: 6). |
 | `--delay, -d <secs>` | Grace period before sleeping (default: 1). |
+| `--pid, -p <pid>` | Watch a specific PID (`--watch-pid` mode only). |
 | `--wait-for-start` | Poll until a Claude process appears. |
 
 ## Mode options
 
 | Flag | Description |
 |---|---|
+| `--doctor` | Report live health of the whole integration, then exit. |
 | `--caffeinate-only` | Release caffeinate but don't sleep the Mac. |
 | `--dry-run` | Simulate: detect and wait, but don't sleep. |
+| `--unattended` | Never prompt; every question takes its safe default. |
 | `--list, -l` | Show detectable Claude processes and exit. |
 | `--preflight, -P` | Run pre-flight scan only, then exit. |
 | `--no-preflight` | Skip pre-flight scan entirely. |
 | `--force, -f` | Skip confirmation prompts. |
-| `--skip-update-check` | Don't check for a newer version on startup. |
-| `--check-update` | Force update check now, bypassing the 24h cache. |
+| `--no-repair` | Don't auto-repair degraded Claude Code hooks. |
+| `--check-update` | Check for a newer version now (off by default). |
+| `--skip-update-check` | Accepted for compatibility; the check is already off. |
 | `--no-auto-caffeinate` | Don't auto-start `caffeinate -dim` if missing. |
 | `--allow-battery` | Proceed even if the Mac is on battery (default: wait for AC). |
 | `--log-summary` | Render the session log as pretty markdown. |
 | `--sleep-now` | Skip the watch: preflight, handle blockers, sleep immediately. |
-| `--smart` | Sleep when all Claude sessions are idle (default when hooks are installed). |
-| `--watch-pid` | Legacy process-exit watch mode (default when hooks are not installed). |
-| `--install-hooks` | Install Claude Code hooks so `--smart` can detect idle sessions. |
+| `--smart` | Idle-aware watch (the default). |
+| `--watch-pid` | Legacy process-exit watch mode. Rarely what you want. |
+| `--install-hooks` | Install/repair the Claude Code hooks. |
 | `--uninstall-hooks` | Remove goodnight's Claude Code hooks. |
 
 ## Output options
@@ -458,13 +598,15 @@ sleep-after-claude [options]
 | `--json` | Emit preflight as JSON for automation. |
 | `--no-sound` | Skip the completion sound. |
 | `--notify, -n` | Send a macOS notification on completion. |
-| `--log` | Append completion events to the log file. |
+| `--log` | Append events to the log file (on by default). |
+| `--no-log` | Disable logging for this run. |
 | `--log-file <path>` | Custom log file (implies `--log`). |
 | `--help, -h` | Show this help. |
 
 ## Defaults
 
-Default log: `~/.local/state/sleep-after-claude.log`
+Logging is on. Default log: `~/.local/state/sleep-after-claude.log`
+(rotated at 2 MB to `.log.1`).
 HELP
 }
 
@@ -527,9 +669,25 @@ LOG_WRITE_FAILED=false
 # stderr warning; subsequent failures stay silent so the tick loop
 # doesn't spam. Return status when disabled is unspecified (no caller
 # checks it).
+LOG_ROTATE_CHECKED=false
+# Rotate once per invocation, not once per event — the size check is a
+# stat() and the tick loop calls log_event often.
+maybe_rotate_log() {
+  [[ "$LOG_ROTATE_CHECKED" == true ]] && return 0
+  LOG_ROTATE_CHECKED=true
+  [[ -f "$LOG_FILE" ]] || return 0
+  local size
+  size="$(stat -f %z "$LOG_FILE" 2>/dev/null || stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)"
+  [[ "$size" =~ ^[0-9]+$ ]] || return 0
+  ((size > LOG_MAX_BYTES)) || return 0
+  # Single generation of history is enough to debug last night's run.
+  mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null || true
+}
+
 log_event() {
   [[ "$LOG_ENABLED" == true ]] || return
   mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+  maybe_rotate_log
   # Brace group + outer 2>/dev/null so the shell's own "No such file or
   # directory" error on a failed >> redirection is also suppressed, not
   # just errors produced by the command itself.
@@ -622,7 +780,7 @@ PREFLIGHT_HIBERNATE_MODE=""
 # Flagging these as blockers creates false alarms.
 #
 # Anchored to exact daemon names (case-sensitive, full match).
-SYSTEM_DAEMONS_REGEX='^(sharingd|powerd|useractivityd|bluetoothd|rcd|coreaudiod|apsd|locationd|cloudd|searchd|mDNSResponder|UserEventAgent|symptomsd|timed|trustd|cfprefsd|WindowServer|loginwindow|SystemUIServer|Dock|Finder|ControlCenter|NotificationCenter|identityservicesd|imagent|callservicesd|remindd|parsecd|bird|iconservicesagent|iconservicesd|diskarbitrationd|fseventsd|spindump|corespeechd|corespotlightd|nsurlsessiond|nsurlstoraged|assistantd|mediaremoted|distnoted|syspolicyd|amfid|taskgated|securityd|secinitd|opendirectoryd|configd|hidd|backlightd|thermalmonitord|pboard|launchservicesd|nfcd|airportd|wifiAgent|wifiFirmwareLoader|wifianalyticsd|watchdogd|appsleepd|routined|avconferenced|bluetoothuserd|gamecontrollerd)$'
+SYSTEM_DAEMONS_REGEX='^(runningboardd|sharingd|powerd|useractivityd|bluetoothd|rcd|coreaudiod|apsd|locationd|cloudd|searchd|mDNSResponder|UserEventAgent|symptomsd|timed|trustd|cfprefsd|WindowServer|loginwindow|SystemUIServer|Dock|Finder|ControlCenter|NotificationCenter|identityservicesd|imagent|callservicesd|remindd|parsecd|bird|iconservicesagent|iconservicesd|diskarbitrationd|fseventsd|spindump|corespeechd|corespotlightd|nsurlsessiond|nsurlstoraged|assistantd|mediaremoted|distnoted|syspolicyd|amfid|taskgated|securityd|secinitd|opendirectoryd|configd|hidd|backlightd|thermalmonitord|pboard|launchservicesd|nfcd|airportd|wifiAgent|wifiFirmwareLoader|wifianalyticsd|watchdogd|appsleepd|routined|avconferenced|bluetoothuserd|gamecontrollerd)$'
 
 # Parse pmset -g assertions into categorized arrays. Used by both full
 # scan and post-watch re-scan (which only needs this).
@@ -1042,7 +1200,13 @@ prompt_confirm() {
   local prompt="$1"
   local response
   printf "  %b " "$prompt"
-  read -r response
+  # Time-bounded: an unanswered prompt resolves to the safe default
+  # rather than holding the process open indefinitely.
+  if ! read -r -t "$PROMPT_TIMEOUT_SECS" response; then
+    echo ""
+    print_warn "No answer in ${PROMPT_TIMEOUT_SECS}s — assuming no."
+    return 1
+  fi
   case "$response" in
     [yY] | [yY][eE][sS]) return 0 ;;
     *) return 1 ;;
@@ -1070,7 +1234,7 @@ print_post_watch_blockers() {
 #
 # These names include camera/audio/display daemons that commonly hold
 # PreventUserIdleSystemSleep while a video app is active.
-SYSTEM_MANAGED_BLOCKERS_REGEX='^(cameracaptured|mediaanalysisd|screencaptureui|replayd|avconferenced|WirelessRadioManagerd|kernel_task|launchd)$'
+SYSTEM_MANAGED_BLOCKERS_REGEX='^(runningboardd|powerd|useractivityd|sharingd|cameracaptured|mediaanalysisd|screencaptureui|replayd|avconferenced|WirelessRadioManagerd|kernel_task|launchd)$'
 
 # Return "system" if the blocker name is system-managed, "user" otherwise.
 classify_blocker() {
@@ -1087,6 +1251,8 @@ classify_blocker() {
 system_blocker_hint() {
   local name="$1"
   case "$name" in
+    runningboardd) echo "Routine macOS process-lifecycle assertion — released automatically at sleep time." ;;
+    powerd | useractivityd | sharingd) echo "macOS power/activity daemon — released automatically at sleep time." ;;
     cameracaptured) echo "Camera is in use — quit Zoom/Meet/FaceTime/Chrome tabs/Continuity Camera." ;;
     mediaanalysisd) echo "Photos is analyzing media — will release on its own shortly." ;;
     screencaptureui | replayd) echo "Screen recording is active — stop the recording." ;;
@@ -1137,20 +1303,26 @@ prompt_and_handle_blockers() {
     return 0
   fi
 
-  if [[ "$STDIN_IS_TTY" != true ]]; then
-    print_error "Sleep blockers detected and stdin is not a TTY for confirmation."
-    print_step "Pass ${BOLD}--force${RESET} to proceed anyway, or ${BOLD}--no-preflight${RESET} to skip the scan."
-    return 1
+  if [[ "$UNATTENDED" == true || "$STDIN_IS_TTY" != true ]]; then
+    # Nobody is here to answer. Proceed rather than abort: the sleep
+    # itself is now verified and retried, so a blocker that survives
+    # shows up as a logged, reported failure instead of a silent
+    # refusal — and aborting here would guarantee the machine stays
+    # awake, which is the worse of the two outcomes.
+    print_warn "${#PREFLIGHT_BLOCKERS[@]} blocker(s) detected, no one to prompt — proceeding; sleep will be verified and retried."
+    log_event "BLOCKERS_UNATTENDED_PROCEED count=${#PREFLIGHT_BLOCKERS[@]}"
+    return 0
   fi
 
+  # Order matters: the first entry is what gum returns if the prompt
+  # times out, so the safe non-destructive choice leads. Terminating
+  # the user's apps must always be a deliberate act.
   local -a menu=()
+  menu+=("s|Skip — proceed; sleep will be verified and retried")
   if [[ ${#user_blockers[@]} -gt 0 ]]; then
-    menu+=("t|Terminate the ${#user_blockers[@]} user app(s) listed above (recommended)")
+    menu+=("t|Terminate the ${#user_blockers[@]} user app(s) listed above")
   fi
-  menu+=(
-    "s|Skip — proceed with watch; sleep may not succeed"
-    "a|Abort — I'll handle these manually"
-  )
+  menu+=("a|Abort — I'll handle these manually")
   local choice
   choice="$(ui_choose "How would you like to proceed?" "${menu[@]}")"
   case "$choice" in
@@ -1267,6 +1439,108 @@ ensure_caffeinate_running() {
   sleep 0.2
   print_ok "Started ${BOLD}caffeinate -dim${RESET} (PID $AUTO_STARTED_CAFFEINATE_PID) to keep the Mac awake"
   log_event "AUTO_CAFFEINATE_STARTED pid=$AUTO_STARTED_CAFFEINATE_PID"
+}
+
+# ── Verified sleep ────────────────────────────────────────────
+#
+# `pmset sleepnow` exits 0 whether or not the machine actually sleeps.
+# If any process holds a PreventSystemSleep assertion, macOS quietly
+# declines and pmset still reports success — so the old code announced
+# "Good night", exited 0, and left the Mac awake all night with no trace
+# of the failure. Every sleep now goes through here, which confirms the
+# outcome against the kernel and retries.
+#
+# Confirmation signal: kern.sleeptime is the timestamp of the last
+# transition into sleep. It moves if and only if the machine slept.
+# (Note that if the Mac sleeps and is never woken, this function simply
+# never returns — the process is frozen mid-call, which is the intended
+# end state.)
+sleep_stamp() {
+  sysctl -n kern.sleeptime 2>/dev/null | tr -cd '0-9 ' | awk '{print $1}'
+}
+wake_stamp() {
+  sysctl -n kern.waketime 2>/dev/null | tr -cd '0-9 ' | awk '{print $1}'
+}
+
+# Kill any caffeinate that has appeared since the watch began. Between
+# retries this matters: a helper or another tool can start a fresh one
+# while we were waiting, and it will block every subsequent attempt.
+release_all_caffeinate() {
+  local pids
+  # shellcheck disable=SC2207
+  pids=($(pgrep -u "$USER" caffeinate 2>/dev/null || true))
+  ((${#pids[@]} == 0)) && return 0
+  kill "${pids[@]}" 2>/dev/null || true
+  sleep 0.3
+  local still=()
+  local p
+  for p in "${pids[@]}"; do
+    kill -0 "$p" 2>/dev/null && still+=("$p")
+  done
+  ((${#still[@]} > 0)) && kill -9 "${still[@]}" 2>/dev/null
+  log_event "CAFFEINATE_RELEASED pids=${pids[*]}"
+  return 0
+}
+
+# Request sleep and verify it happened. Returns 0 on confirmed sleep,
+# 1 if every attempt was refused.
+attempt_sleep() {
+  local context="${1:-}"
+  local attempt=1 s0 s1 t0 t1 elapsed backoff
+
+  while ((attempt <= SLEEP_MAX_ATTEMPTS)); do
+    s0="$(sleep_stamp)"
+    t0=$(date +%s)
+    log_event "SLEEP_ATTEMPT n=${attempt}/${SLEEP_MAX_ATTEMPTS} ctx=${context}"
+
+    if ! pmset sleepnow >/dev/null 2>&1; then
+      osascript -e 'tell application "System Events" to sleep' >/dev/null 2>&1 || true
+    fi
+
+    # Give macOS time to complete the transition. If it does, execution
+    # stops here until the machine wakes.
+    sleep "$SLEEP_VERIFY_SECS"
+
+    t1=$(date +%s)
+    s1="$(sleep_stamp)"
+    elapsed=$((t1 - t0))
+
+    if [[ -n "$s0" && -n "$s1" && "$s0" != "$s1" ]]; then
+      log_event "SLEEP_CONFIRMED n=${attempt} via=kern.sleeptime"
+      return 0
+    fi
+    # Fallback signal for the case where sysctl is unreadable: a wall
+    # clock that jumped far past our wait can only mean we were
+    # suspended through it.
+    if ((elapsed > SLEEP_VERIFY_SECS + 10)); then
+      log_event "SLEEP_CONFIRMED n=${attempt} via=clock_jump elapsed=${elapsed}s"
+      return 0
+    fi
+
+    # Refused. Work out who is holding it and try to clear the way.
+    scan_assertions
+    local blocker_names=""
+    if ((${#PREFLIGHT_BLOCKERS[@]} > 0)); then
+      local entry bpid bname btype
+      for entry in "${PREFLIGHT_BLOCKERS[@]}"; do
+        IFS='|' read -r bpid bname btype <<<"$entry"
+        blocker_names+="${bname}(${bpid}):${btype} "
+      done
+    fi
+    log_event "SLEEP_REFUSED n=${attempt} blockers=[${blocker_names% }]"
+
+    if ((attempt >= SLEEP_MAX_ATTEMPTS)); then
+      break
+    fi
+
+    print_warn "Sleep was refused${blocker_names:+ — holding: ${blocker_names% }}. Retrying…"
+    release_all_caffeinate
+    backoff=$((attempt * SLEEP_RETRY_BACKOFF_SECS))
+    sleep "$backoff"
+    attempt=$((attempt + 1))
+  done
+
+  return 1
 }
 
 # ── Power-state gate ──────────────────────────────────────────
@@ -1401,6 +1675,7 @@ wait_for_ac_power() {
 # network errors, missing curl/shasum, or any unexpected output cause
 # the check to be silently skipped so offline users aren't blocked.
 check_for_update() {
+  [[ "$SKIP_UPDATE_CHECK_FORCED" == true ]] && return 0
   [[ "$SKIP_UPDATE_CHECK" == true ]] && return 0
   command -v curl >/dev/null 2>&1 || return 0
   command -v shasum >/dev/null 2>&1 || return 0
@@ -1494,14 +1769,274 @@ check_for_update() {
   fi
 }
 
-# Return 0 if goodnight's hook entries are present in the Claude Code
-# settings file. Smart mode requires jq at hook runtime, so absence of jq
-# means hooks are not operational even if marker text exists in the file.
+# jq predicate identifying a hook entry as one of ours.
+#
+# Ordering matters. The command-string sentinel is checked FIRST and the
+# ._managed_by JSON tag second, because the tag is the fragile half: it
+# is a key we invented, sitting next to keys Claude Code owns, and
+# anything that rewrites settings.json is free to drop it while faithfully
+# preserving the command it annotates. That is not hypothetical — it is
+# exactly how this command silently stopped working. Detection must key on
+# the payload that has to survive for the hook to run at all.
+# Two questions, deliberately distinct:
+#
+#   gn_functional  does this entry still carry a command that does the
+#                  job? This is what health must ask. The tag alone is
+#                  not enough: an entry whose command was emptied or
+#                  replaced would otherwise report healthy, skip repair,
+#                  and leave an active turn markerless for the watcher
+#                  to sleep over — the original bug wearing the opposite
+#                  mask.
+#
+#   gn_owned       is this entry ours to rewrite or remove? Broader on
+#                  purpose, because a mangled entry we installed is
+#                  still ours to clean up, so ownership accepts the tag.
+HOOK_MATCH_JQ='def gn_cmds: [ (.hooks // [])[] | (.command // "") ];
+  def gn_functional: (gn_cmds | any(test("goodnight-hook|goodnight/busy")));
+  def gn_owned: gn_functional or (._managed_by == "goodnight");'
+
+# Report the health of goodnight'"'"'s Claude Code hook integration.
+# Echoes exactly one word:
+#   ok       both UserPromptSubmit and Stop hooks present and usable
+#   partial  one of the two present — markers would leak or never appear
+#   missing  neither present
+#   nofile   no settings.json at all
+#   badjson  settings.json exists but does not parse
+#   nojq     jq absent, so the hook bodies could not run even if present
+# Smart mode needs jq at HOOK runtime, so a missing jq is a health
+# failure regardless of what the file says.
+hooks_health() {
+  command -v jq >/dev/null 2>&1 || {
+    echo nojq
+    return
+  }
+  [[ -f "$CLAUDE_SETTINGS_FILE" ]] || {
+    echo nofile
+    return
+  }
+  local counts
+  # Parenthesised deliberately: in jq `|` binds looser than `,`, so
+  # `[…] | length, […] | length` would parse as one pipeline and emit
+  # the wrong pair.
+  counts="$(jq -r "${HOOK_MATCH_JQ}"'
+    ([ (.hooks.UserPromptSubmit // [])[] | select(gn_functional) ] | length),
+    ([ (.hooks.Stop            // [])[] | select(gn_functional) ] | length),
+    ([ (.hooks.SessionEnd      // [])[] | select(gn_functional) ] | length)
+  ' "$CLAUDE_SETTINGS_FILE" 2>/dev/null)" || {
+    echo badjson
+    return
+  }
+  [[ -n "$counts" ]] || {
+    echo badjson
+    return
+  }
+  local ups stop send
+  ups="$(printf '%s\n' "$counts" | sed -n 1p)"
+  stop="$(printf '%s\n' "$counts" | sed -n 2p)"
+  send="$(printf '%s\n' "$counts" | sed -n 3p)"
+  [[ "$ups" =~ ^[0-9]+$ && "$stop" =~ ^[0-9]+$ && "$send" =~ ^[0-9]+$ ]] || {
+    echo badjson
+    return
+  }
+  # SessionEnd counts toward health, not just the other two. An install
+  # predating it reports `partial`, which routes it through repair once
+  # and leaves it whole. Otherwise an upgraded machine keeps leaking a
+  # marker on every quit or crash until the stale window expires, and
+  # never finds out it is missing the hook that would prevent it.
+  if ((ups > 0 && stop > 0 && send > 0)); then
+    echo ok
+  elif ((ups > 0 || stop > 0 || send > 0)); then
+    echo partial
+  else
+    echo missing
+  fi
+}
+
+# Return 0 only when the integration is fully operational. A partial
+# install is deliberately NOT "installed": without UserPromptSubmit no
+# marker is ever written, so a marker-trusting watcher would read a busy
+# machine as idle and sleep it mid-task. Fail toward staying awake.
 hooks_installed() {
-  [[ -f "$CLAUDE_SETTINGS_FILE" ]] || return 1
+  [[ "$(hooks_health)" == "ok" ]]
+}
+
+# Return 0 when our hook entries exist but have lost the ._managed_by
+# tag. They still work — detection matches the command sentinel — but
+# --uninstall-hooks and reinstall de-duplication both key on the tag, so
+# an untagged install is a booby trap for the next write. Repair fixes
+# it in place rather than appending a second copy.
+hooks_need_retag() {
   command -v jq >/dev/null 2>&1 || return 1
-  jq -e '(.hooks.Stop // []) + (.hooks.UserPromptSubmit // []) | map(select(._managed_by == "goodnight")) | length > 0' \
-    "$CLAUDE_SETTINGS_FILE" >/dev/null 2>&1
+  [[ -f "$CLAUDE_SETTINGS_FILE" ]] || return 1
+  jq -e "${HOOK_MATCH_JQ}"'
+    [ ((.hooks.UserPromptSubmit // []) + (.hooks.Stop // []) + (.hooks.SessionEnd // []))[]
+      | select(gn_owned) | select(._managed_by != "goodnight") ] | length > 0
+  ' "$CLAUDE_SETTINGS_FILE" >/dev/null 2>&1
+}
+
+# Restore a degraded hook integration to full health, in place.
+#
+# Two failure shapes are repaired:
+#   untagged  our commands survived but ._managed_by was stripped —
+#             re-tag the existing entries (never append a duplicate)
+#   partial   one event lost its entry entirely — reinstall both sides
+#
+# Returns 0 if the integration is healthy afterwards, 1 otherwise.
+# Never prompts: this runs on the unattended path.
+repair_claude_hooks() {
+  local health
+  health="$(hooks_health)"
+
+  if [[ "$health" == "nojq" ]]; then
+    return 1
+  fi
+
+  # Re-tag first — cheap, non-destructive, and it makes a subsequent
+  # reinstall de-duplicate correctly instead of doubling the hooks.
+  if hooks_need_retag; then
+    local tmp
+    tmp="$(mktemp)" || return 1
+    if jq "${HOOK_MATCH_JQ}"'
+      def retag: if gn_owned then (._managed_by = "goodnight") else . end;
+      .hooks = (.hooks // {})
+      | (if (.hooks.UserPromptSubmit | type) == "array" then .hooks.UserPromptSubmit |= map(retag) else . end)
+      | (if (.hooks.Stop            | type) == "array" then .hooks.Stop            |= map(retag) else . end)
+      | (if (.hooks.SessionEnd      | type) == "array" then .hooks.SessionEnd      |= map(retag) else . end)
+    ' "$CLAUDE_SETTINGS_FILE" >"$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+      cp "$CLAUDE_SETTINGS_FILE" "${CLAUDE_SETTINGS_FILE}.bak.$(date +%s)" 2>/dev/null || true
+      mv "$tmp" "$CLAUDE_SETTINGS_FILE" 2>/dev/null || rm -f "$tmp"
+      log_event "HOOKS_RETAGGED"
+    else
+      rm -f "$tmp"
+    fi
+    health="$(hooks_health)"
+  fi
+
+  # Anything short of a complete install gets a full (idempotent)
+  # reinstall. install_claude_hooks de-duplicates by command sentinel as
+  # well as by tag, so this cannot stack copies.
+  if [[ "$health" != "ok" ]]; then
+    install_claude_hooks >/dev/null 2>&1 || true
+    log_event "HOOKS_REINSTALLED prior_state=$health"
+    health="$(hooks_health)"
+  fi
+
+  [[ "$health" == "ok" ]]
+}
+
+# ── Session activity model ────────────────────────────────────
+#
+# Two independent signals answer "is any agent still working?", and the
+# watcher requires BOTH to be quiet before it will sleep the machine.
+#
+#   1. Busy markers   — written by our UserPromptSubmit hook, removed by
+#                       Stop/SessionEnd. Precise and instant, but only as
+#                       trustworthy as the hooks themselves.
+#   2. Transcript mtime — Claude appends to
+#                       $CLAUDE_PROJECTS_DIR/<slug>/<session_id>.jsonl
+#                       throughout a turn. Needs no cooperation, cannot
+#                       be silently uninstalled, and covers sessions we
+#                       have no marker for at all (background agents,
+#                       sessions started before the hooks existed).
+#
+# Marker presence decides WHICH sessions to care about; transcript mtime
+# decides whether a marked session is genuinely alive. That combination
+# is what makes a crashed session, or one parked on a permission prompt,
+# stop blocking sleep — the old code would wait on its marker for a full
+# 24 hours.
+
+# Locate the transcript for a session id. Echoes the path, or nothing.
+transcript_for_session() {
+  local sid="$1" f
+  [[ -n "$sid" ]] || return 1
+  [[ -d "$CLAUDE_PROJECTS_DIR" ]] || return 1
+  for f in "$CLAUDE_PROJECTS_DIR"/*/"${sid}.jsonl"; do
+    [[ -f "$f" ]] || continue
+    printf '%s' "$f"
+    return 0
+  done
+  return 1
+}
+
+# Return 0 if ANY agent — Claude Code, Codex, or anything added via
+# SAC_EXTRA_ACTIVITY_DIRS — wrote to its session log within the last N
+# seconds. One find(1) per root, and -quit stops at the first hit, so
+# cost does not grow with session-history size.
+transcript_active_within() {
+  local secs="$1" mins dir hit
+  # find -mmin takes minutes; round up so a sub-minute window still
+  # looks at the most recent minute rather than truncating to zero.
+  mins=$(((secs + 59) / 60))
+  ((mins < 1)) && mins=1
+  for dir in "${AGENT_ACTIVITY_DIRS[@]}"; do
+    [[ -d "$dir" ]] || continue
+    hit="$(find "$dir" -name '*.jsonl' -mmin -"$mins" -print -quit 2>/dev/null)"
+    [[ -n "$hit" ]] && return 0
+  done
+  return 1
+}
+
+# Echo the epoch mtime of the most recently written agent session log
+# across every activity root, or nothing when there are none.
+newest_agent_activity() {
+  local dir
+  {
+    for dir in "${AGENT_ACTIVITY_DIRS[@]}"; do
+      [[ -d "$dir" ]] || continue
+      find "$dir" -name '*.jsonl' -print0 2>/dev/null |
+        xargs -0 stat -f '%m' 2>/dev/null
+    done
+  } | sort -rn | head -1
+}
+
+# Delete busy markers that no longer represent live work:
+#   - session transcript missing entirely (session id we can't verify,
+#     and the marker itself is older than the stale window)
+#   - session transcript untouched for longer than the stale window
+#     (crashed, or parked waiting on input — either way, not working)
+# Echoes the number of markers reaped.
+reap_dead_markers() {
+  [[ -d "$BUSY_DIR" ]] || {
+    echo 0
+    return
+  }
+  local f sid tpath probe mtime age reaped=0 now cutoff
+  now="$(date +%s)"
+  cutoff=$((SMART_STALE_MARKER_MINS * 60))
+  for f in "$BUSY_DIR"/*; do
+    [[ -f "$f" ]] || continue
+    sid="$(basename "$f")"
+    # The session transcript is the authority on liveness. Only when
+    # there is none to consult does the marker's own age stand in, so an
+    # unrecognised session still gets a full stale window of benefit of
+    # the doubt before we discount it.
+    tpath="$(transcript_for_session "$sid" || true)"
+    probe="${tpath:-$f}"
+    # stat rather than `find -mmin`: one fork either way, but this
+    # compares exact seconds instead of find's minute granularity, so
+    # the stale window means what it says.
+    mtime="$(stat -f %m "$probe" 2>/dev/null)"
+    [[ "$mtime" =~ ^[0-9]+$ ]] || continue
+    age=$((now - mtime))
+    if ((age > cutoff)); then
+      rm -f "$f" 2>/dev/null && reaped=$((reaped + 1))
+    fi
+  done
+  echo "$reaped"
+}
+
+# Count busy markers that survive the liveness check above.
+count_busy_sessions() {
+  [[ -d "$BUSY_DIR" ]] || {
+    echo 0
+    return
+  }
+  reap_dead_markers >/dev/null
+  local f count=0
+  for f in "$BUSY_DIR"/*; do
+    [[ -f "$f" ]] && count=$((count + 1))
+  done
+  echo "$count"
 }
 
 # ── Claude Code hook integration ──────────────────────────────
@@ -1550,8 +2085,19 @@ install_claude_hooks() {
     quoted_busy="${BUSY_DIR//\'/\'\\\'\'}"
     busy_path_expr="'${quoted_busy}'"
   fi
-  prompt_cmd="mkdir -p ${busy_path_expr} 2>/dev/null; sid=\$(jq -r .session_id 2>/dev/null); [ -n \"\$sid\" ] && touch ${busy_path_expr}/\"\$sid\"; exit 0"
-  stop_cmd="sid=\$(jq -r .session_id 2>/dev/null); [ -n \"\$sid\" ] && rm -f ${busy_path_expr}/\"\$sid\"; exit 0"
+  # Every command carries the "# goodnight-hook" sentinel as a trailing
+  # shell comment: inert at runtime, but it makes the entry
+  # self-identifying even after a settings.json rewrite drops the
+  # sibling ._managed_by key. See HOOK_MATCH_JQ.
+  local sentinel="# ${HOOK_SENTINEL}"
+  prompt_cmd="mkdir -p ${busy_path_expr} 2>/dev/null; sid=\$(jq -r .session_id 2>/dev/null); [ -n \"\$sid\" ] && touch ${busy_path_expr}/\"\$sid\"; exit 0 ${sentinel}"
+  stop_cmd="sid=\$(jq -r .session_id 2>/dev/null); [ -n \"\$sid\" ] && rm -f ${busy_path_expr}/\"\$sid\"; exit 0 ${sentinel}"
+  # Stop fires at the end of each assistant turn. SessionEnd covers the
+  # ways a session can leave without a final turn — quit mid-response,
+  # closed terminal, crash — which is precisely how the marker
+  # directory had accumulated 30 orphans. Same body as stop_cmd; the
+  # remove is idempotent.
+  local end_cmd="$stop_cmd"
 
   # Back up existing file
   if [[ -f "$CLAUDE_SETTINGS_FILE" ]]; then
@@ -1560,18 +2106,22 @@ install_claude_hooks() {
     echo '{}' >"$CLAUDE_SETTINGS_FILE"
   fi
 
-  # Merge the hooks. Remove any prior goodnight-managed entries first
-  # (tagged via a "_managed_by: goodnight" field in the hook object)
-  # so reinstalls don't duplicate. Then append the fresh entries.
+  # Merge the hooks. Strip any prior goodnight entry first so reinstalls
+  # replace rather than accumulate.
+  #
+  # De-duplication matches on the command sentinel as well as the
+  # ._managed_by tag (gn_owned). Matching on the tag alone is what would
+  # turn a repair into a duplicate: an entry that had lost its tag would
+  # survive the strip, then the fresh copy would be appended beside it
+  # and every prompt would fire the hook twice.
   local tmp
   tmp="$(mktemp)"
-  if ! jq --arg prompt_cmd "$prompt_cmd" --arg stop_cmd "$stop_cmd" '
-    # Ensure .hooks exists
+  if ! jq --arg prompt_cmd "$prompt_cmd" --arg stop_cmd "$stop_cmd" --arg end_cmd "$end_cmd" \
+    "${HOOK_MATCH_JQ}"'
     .hooks = (.hooks // {})
-    # Strip any prior goodnight-managed entries
-    | .hooks.UserPromptSubmit = [ (.hooks.UserPromptSubmit // [])[] | select(._managed_by != "goodnight") ]
-    | .hooks.Stop            = [ (.hooks.Stop            // [])[] | select(._managed_by != "goodnight") ]
-    # Append fresh entries
+    | .hooks.UserPromptSubmit = [ (.hooks.UserPromptSubmit // [])[] | select(gn_owned | not) ]
+    | .hooks.Stop             = [ (.hooks.Stop             // [])[] | select(gn_owned | not) ]
+    | .hooks.SessionEnd       = [ (.hooks.SessionEnd       // [])[] | select(gn_owned | not) ]
     | .hooks.UserPromptSubmit += [{
         matcher: "",
         _managed_by: "goodnight",
@@ -1581,6 +2131,11 @@ install_claude_hooks() {
         matcher: "",
         _managed_by: "goodnight",
         hooks: [{ type: "command", command: $stop_cmd }]
+      }]
+    | .hooks.SessionEnd += [{
+        matcher: "",
+        _managed_by: "goodnight",
+        hooks: [{ type: "command", command: $end_cmd }]
       }]
   ' "$CLAUDE_SETTINGS_FILE" >"$tmp"; then
     rm -f "$tmp"
@@ -1611,13 +2166,18 @@ uninstall_claude_hooks() {
   fi
   local tmp
   tmp="$(mktemp)"
-  if ! jq '
+  # Matches on the command sentinel as well as the tag, so an entry that
+  # has lost ._managed_by is still removable instead of becoming an
+  # un-uninstallable orphan.
+  if ! jq "${HOOK_MATCH_JQ}"'
     .hooks = (.hooks // {})
-    | .hooks.UserPromptSubmit = [ (.hooks.UserPromptSubmit // [])[] | select(._managed_by != "goodnight") ]
-    | .hooks.Stop            = [ (.hooks.Stop            // [])[] | select(._managed_by != "goodnight") ]
+    | .hooks.UserPromptSubmit = [ (.hooks.UserPromptSubmit // [])[] | select(gn_owned | not) ]
+    | .hooks.Stop             = [ (.hooks.Stop             // [])[] | select(gn_owned | not) ]
+    | .hooks.SessionEnd       = [ (.hooks.SessionEnd       // [])[] | select(gn_owned | not) ]
     # Drop empty arrays so settings.json stays tidy.
     | if (.hooks.UserPromptSubmit | length) == 0 then del(.hooks.UserPromptSubmit) else . end
     | if (.hooks.Stop            | length) == 0 then del(.hooks.Stop)            else . end
+    | if (.hooks.SessionEnd      | length) == 0 then del(.hooks.SessionEnd)      else . end
     | if (.hooks | length) == 0 then del(.hooks) else . end
   ' "$CLAUDE_SETTINGS_FILE" >"$tmp"; then
     rm -f "$tmp"
@@ -1632,107 +2192,152 @@ uninstall_claude_hooks() {
   print_ok "Removed goodnight hooks from ${BOLD}$CLAUDE_SETTINGS_FILE${RESET}"
 }
 
-# Count Claude sessions currently marked busy. Stale markers older
-# than SMART_STALE_MARKER_MINS are treated as dead and deleted.
-# Returns the count on stdout.
-count_busy_sessions() {
-  [[ -d "$BUSY_DIR" ]] || {
-    echo 0
-    return
-  }
-  local f count=0
-  # Stale-marker reaper: a marker older than $SMART_STALE_MARKER_MINS
-  # (default 24h) is assumed to belong to a crashed session. The
-  # threshold is intentionally loose so a legitimately long-running
-  # Claude task isn't reaped mid-work (F-08).
-  find "$BUSY_DIR" -type f -mmin +"$SMART_STALE_MARKER_MINS" -delete 2>/dev/null || true
-  for f in "$BUSY_DIR"/*; do
-    [[ -f "$f" ]] && count=$((count + 1))
-  done
-  echo "$count"
-}
-
-# Smart-watch loop. Polls the busy directory every 2 seconds. Sleep
-# fires only when BOTH enforced hook-state conditions hold:
-#   (a) at least one busy marker has been observed since watch start
-#       (prevents premature-sleep on cold start — F-01), AND
-#   (b) the busy directory has been empty continuously for
-#       SMART_IDLE_SECONDS.
+# Smart-watch loop.
 #
-# If no busy marker ever appears but there IS a live Claude process,
-# the loop stays in "cold" state and warns the user via the spinner
-# text that hooks may not be loaded in the running session. There is
-# no separate live-process absence guard in smart mode; hooks are the
-# contract for idle detection.
+# Sleeps the machine once every tracked agent has been quiet for
+# SMART_IDLE_SECONDS. "Quiet" requires two independent signals to agree:
+#
+#   busy markers  == 0  (no session is mid-turn, per the Claude hooks)
+#   transcript writes within the idle window == none
+#
+# Requiring both means a hook that silently stopped firing cannot cause
+# a premature sleep — the transcript check still sees the work. It also
+# means a marker left behind by a crashed or prompt-blocked session
+# cannot wedge the loop forever: count_busy_sessions reaps any marker
+# whose transcript has gone quiet past the stale window.
+#
+# Deliberate change from earlier behaviour: there is no longer a
+# cold-start hold. The old loop refused to sleep until it had personally
+# witnessed a busy marker appear, which meant the common case — every
+# agent already finished before you type `goodnight` — waited forever
+# and the machine never slept. Starting quiet is now a valid path to
+# sleep, and the transcript check is what makes that safe.
+#
+# Returns:
+#   0  idle reached
+#   2  hard timeout reached (caller sleeps anyway)
 smart_watch_loop() {
-  local idle_start=0 now busy seen_busy=false
+  local now busy recent_write activity_ts last_activity
   local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
-  local tick=0
-  local start_ts
+  local tick=0 poll
+  local start_ts elapsed idle_for remaining
+  local last_log=0 entry_sleep_stamp
   start_ts=$(date +%s)
-  # If any marker already exists at entry (another terminal has a
-  # submitted prompt in flight, or a prior run left a fresh marker),
-  # consider that proof-of-life so we don't sit in cold mode forever.
-  if (($(count_busy_sessions) > 0)); then
-    seen_busy=true
-  fi
+  # Floor the clock at watch start: with no session logs at all there is
+  # nothing to measure quiet from, and the watch should still be able to
+  # conclude after one idle window rather than never.
+  last_activity=$start_ts
+  entry_sleep_stamp="$(sleep_stamp)"
 
   while true; do
-    busy="$(count_busy_sessions)"
     now=$(date +%s)
-    if [[ "$busy" != "0" ]]; then
-      seen_busy=true
-    fi
-    if [[ "$busy" == "0" ]] && [[ "$seen_busy" == true ]]; then
-      if ((idle_start == 0)); then
-        idle_start=$now
+    elapsed=$((now - start_ts))
+
+    # Did the Mac sleep while we were watching — lid closed, Apple menu,
+    # another tool? Then the job is done and this process is simply the
+    # last thing to notice.
+    #
+    # Without this the wall clock, which kept running through the
+    # suspension, reads as elapsed watch time: close the lid at
+    # midnight, open it at nine, and the timeout branch below fires
+    # instantly and puts the machine straight back to sleep in your
+    # hands. Exit instead, and say why.
+    if [[ -n "$entry_sleep_stamp" ]]; then
+      local now_sleep_stamp
+      now_sleep_stamp="$(sleep_stamp)"
+      if [[ -n "$now_sleep_stamp" && "$now_sleep_stamp" != "$entry_sleep_stamp" ]]; then
+        clear_line
+        print_ok "The Mac slept while goodnight was watching — nothing left to do."
+        log_event "SLEPT_EXTERNALLY after=${elapsed}s"
+        return 3
       fi
-      local idle_for=$((now - idle_start))
+    fi
+
+    # Hard cap. The previous loop had none: a single stuck marker meant
+    # `goodnight` ran until morning and the Mac never slept. --timeout
+    # now bounds every wait path in the program.
+    if ((SMART_TIMEOUT_SECS > 0 && elapsed >= SMART_TIMEOUT_SECS)); then
+      clear_line
+      print_warn "Timeout of ${TIMEOUT_HOURS}h reached — proceeding to sleep anyway."
+      log_event "SMART_TIMEOUT after=${elapsed}s busy=$(count_busy_sessions)"
+      return 2
+    fi
+
+    busy="$(count_busy_sessions)"
+    # Work from the timestamp of the last observed activity rather than
+    # a boolean "was anything written recently".
+    #
+    # The boolean version stacked two full windows: it only stopped
+    # reporting activity once a log had already been quiet for
+    # SMART_IDLE_SECONDS, and the countdown then started from there — so
+    # the machine slept roughly 2×--idle after the last write, not
+    # --idle. Reading the mtime directly makes the wait mean what the
+    # flag says.
+    if [[ "$busy" != "0" ]]; then
+      last_activity=$now
+    else
+      activity_ts="$(newest_agent_activity)"
+      if [[ "$activity_ts" =~ ^[0-9]+$ ]] && ((activity_ts > last_activity)); then
+        last_activity=$activity_ts
+      fi
+    fi
+    idle_for=$((now - last_activity))
+    ((idle_for < 0)) && idle_for=0
+    # Only used for the non-TTY status line, to name which of the two
+    # signals is holding things up.
+    recent_write=false
+    [[ "$busy" == "0" ]] && ((idle_for < SMART_IDLE_SECONDS)) && recent_write=true
+
+    if [[ "$busy" == "0" ]]; then
       if ((idle_for >= SMART_IDLE_SECONDS)); then
         clear_line
-        print_ok "All Claude sessions idle for ${SMART_IDLE_SECONDS}s — proceeding to sleep."
+        print_ok "All agents idle for $(elapsed_label "$idle_for") — proceeding to sleep."
+        log_event "SMART_IDLE_REACHED waited=${elapsed}s idle_for=${idle_for}s"
         return 0
       fi
+      remaining=$((SMART_IDLE_SECONDS - idle_for))
       if [[ "$USE_SPINNER" == true ]]; then
-        printf "\r  %s%s%s  %sAll Claude sessions idle…%s  sleeping in %ds    " \
+        printf "\r  %s%s%s  %sAll agents idle…%s  sleeping in %s      " \
           "$GREEN" "${frames[$tick]}" "$RESET" \
           "$DIM" "$RESET" \
-          "$((SMART_IDLE_SECONDS - idle_for))"
+          "$(elapsed_label "$remaining")"
+      elif ((now - last_log >= 60)); then
+        last_log=$now
+        echo "  … all agents idle, sleeping in $(elapsed_label "$remaining")"
       fi
-    elif [[ "$busy" == "0" ]]; then
-      # Cold-start state: no busy marker ever seen this run. Don't
-      # start the idle countdown yet — wait for a submission. Hint
-      # once per minute that hooks may not be loaded in the current
-      # Claude session.
-      idle_start=0
-      if [[ "$USE_SPINNER" == true ]]; then
-        local elapsed=$((now - start_ts))
-        printf "\r  %s%s%s  %sWaiting for a Claude prompt…%s  %ds elapsed    " \
-          "$YELLOW" "${frames[$tick]}" "$RESET" \
-          "$DIM" "$RESET" \
-          "$elapsed"
+      # Tighten the poll only for the last stretch of the countdown.
+      # The interval is the race window — a session that resumes just
+      # after a check is one we could sleep on top of — so it wants to
+      # be small at the moment we are about to act, and no smaller than
+      # it needs to be for the several minutes before that.
+      if ((remaining <= 30)); then
+        poll=1
       else
-        if (((now / 60) != ${LAST_STATUS_MIN:-0})); then
-          LAST_STATUS_MIN=$((now / 60))
-          echo "  … waiting for a Claude prompt (no busy marker yet)"
-        fi
+        poll=5
       fi
     else
-      # busy > 0: some session is actively processing.
-      idle_start=0
       if [[ "$USE_SPINNER" == true ]]; then
-        printf "\r  %s%s%s  %sWaiting — %d Claude session(s) busy…%s                 " \
-          "$CYAN" "${frames[$tick]}" "$RESET" \
-          "$DIM" "$busy" "$RESET"
-      else
-        if (((now / 60) != ${LAST_STATUS_MIN:-0})); then
-          LAST_STATUS_MIN=$((now / 60))
-          echo "  … $busy Claude session(s) busy"
+        local why
+        if [[ "$busy" != "0" ]]; then
+          why="${busy} session(s) working"
+        else
+          why="agent output still being written"
         fi
+        printf "\r  %s%s%s  %sWaiting — %s…%s  %s elapsed      " \
+          "$CYAN" "${frames[$tick]}" "$RESET" \
+          "$DIM" "$why" "$RESET" \
+          "$(elapsed_label "$elapsed")"
+      elif ((now - last_log >= 300)); then
+        last_log=$now
+        echo "  … still waiting (busy=$busy recent_output=$recent_write, $(elapsed_label "$elapsed") elapsed)"
       fi
+      # Nothing is imminent, so poll lazily. At 5s this is ~700 wakeups
+      # over an eight-hour night instead of ~14,000.
+      poll=5
     fi
+
     tick=$(((tick + 1) % ${#frames[@]}))
-    sleep 2
+    micro_sleep "$poll"
   done
 }
 
@@ -1754,6 +2359,10 @@ while [[ $# -gt 0 ]]; do
       fi
       TARGET_PID="$2"
       TARGET_PID_EXPLICIT=true
+      # Naming a PID is an unambiguous request to watch that process,
+      # so it selects PID mode outright. Without this the smart-mode
+      # default would silently ignore the flag the user just passed.
+      WATCH_PID_MODE=true
       shift 2
       ;;
     --delay | -d)
@@ -1798,7 +2407,11 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --wait-for-start)
+      # Waiting for a process to appear only means anything in the
+      # process-watch flow, so it selects that mode explicitly rather
+      # than being quietly dropped by the smart-mode default.
       WAIT_FOR_START=true
+      WATCH_PID_MODE=true
       shift
       ;;
     --preflight | -P)
@@ -1826,8 +2439,9 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --check-update)
-      # Force an immediate update check, bypassing the 24h rate-limit
-      # cache, then continue with the normal flow.
+      # Opt in to the update check for this run and bypass the 24h
+      # rate-limit cache, then continue with the normal flow.
+      SKIP_UPDATE_CHECK=false
       rm -f "$UPDATE_CACHE_DIR/last-update-check" 2>/dev/null || true
       shift
       ;;
@@ -1867,6 +2481,39 @@ while [[ $# -gt 0 ]]; do
       WATCH_PID_MODE=true
       shift
       ;;
+    --idle)
+      if [[ -z "${2:-}" ]] || ! is_positive_integer "$2"; then
+        echo -e "${RED}✖  --idle requires a positive integer (seconds)${RESET}" >&2
+        exit 1
+      fi
+      SMART_IDLE_SECONDS="$2"
+      shift 2
+      ;;
+    --stale)
+      if [[ -z "${2:-}" ]] || ! is_positive_integer "$2"; then
+        echo -e "${RED}✖  --stale requires a positive integer (minutes)${RESET}" >&2
+        exit 1
+      fi
+      SMART_STALE_MARKER_MINS="$2"
+      shift 2
+      ;;
+    --unattended)
+      # Never prompt. Every question resolves to its safe default.
+      UNATTENDED=true
+      shift
+      ;;
+    --no-repair)
+      NO_REPAIR=true
+      shift
+      ;;
+    --no-log)
+      LOG_ENABLED=false
+      shift
+      ;;
+    --doctor)
+      DOCTOR_MODE=true
+      shift
+      ;;
     --install-hooks)
       INSTALL_HOOKS=true
       shift
@@ -1900,11 +2547,16 @@ if [[ "$SMART_WATCH" != true && "$WATCH_PID_MODE" != true &&
   "$SLEEP_NOW" != true && "$PREFLIGHT_ONLY" != true &&
   "$LIST_MODE" != true && "$LOG_SUMMARY" != true &&
   "$INSTALL_HOOKS" != true && "$UNINSTALL_HOOKS" != true ]]; then
-  if hooks_installed; then
-    SMART_WATCH=true
-  else
-    WATCH_PID_MODE=true
-  fi
+  # Smart mode is now the unconditional default.
+  #
+  # It used to fall back to PID-watching whenever hook detection failed,
+  # which is how a single stripped JSON key turned `goodnight` into a
+  # command that waited for an interactive Claude REPL to exit — that is
+  # to say, until the 6h timeout, every night, silently. Smart mode
+  # repairs its own hooks and degrades to transcript-activity detection
+  # if it can't, so there is no failure it needs PID mode to cover.
+  # PID mode remains available, but only when asked for by name.
+  SMART_WATCH=true
 fi
 
 # ── Open persistent FIFO FD for fork-free micro_sleep ─────────
@@ -2006,6 +2658,143 @@ if [[ "$UNINSTALL_HOOKS" == true ]]; then
   print_header
   uninstall_claude_hooks
   exit $?
+fi
+
+# ── --doctor mode ─────────────────────────────────────────────
+# One command that answers "is this thing actually going to work
+# tonight?" without reading any source. The failure that prompted it
+# was invisible from the outside: the hooks looked installed, markers
+# were still being written, and the command still appeared to run —
+# it had just silently stopped using any of that. Anything the watch
+# depends on is therefore reported here as observed state, not as a
+# claim. Exits non-zero when the integration is degraded so it can be
+# used as a health check.
+if [[ "$DOCTOR_MODE" == true ]]; then
+  print_header
+  doctor_rc=0
+
+  ui_section "Hook integration" "Claude Code settings: $CLAUDE_SETTINGS_FILE"
+  dr_health="$(hooks_health)"
+  case "$dr_health" in
+    ok)
+      print_ok "Hooks healthy — UserPromptSubmit, Stop and SessionEnd all present."
+      ;;
+    partial)
+      print_error "Hooks PARTIAL — UserPromptSubmit, Stop and SessionEnd are not all installed."
+      print_step "Repair with: ${BOLD}goodnight --install-hooks${RESET}"
+      doctor_rc=1
+      ;;
+    missing)
+      print_error "Hooks MISSING — no goodnight entries in settings.json."
+      print_step "Install with: ${BOLD}goodnight --install-hooks${RESET}"
+      doctor_rc=1
+      ;;
+    nojq)
+      print_error "jq not found on PATH — hook bodies cannot run."
+      print_step "Install with: ${BOLD}brew install jq${RESET}"
+      doctor_rc=1
+      ;;
+    nofile)
+      print_error "No settings file at $CLAUDE_SETTINGS_FILE."
+      doctor_rc=1
+      ;;
+    badjson)
+      print_error "settings.json is not valid JSON — hooks cannot be read."
+      doctor_rc=1
+      ;;
+  esac
+  if [[ "$dr_health" != "nojq" ]] && hooks_need_retag; then
+    print_warn "Hook entries have lost their ._managed_by tag."
+    print_step "They still fire (matched by command sentinel), but reinstall would duplicate them."
+    print_step "Fix with: ${BOLD}goodnight --install-hooks${RESET}"
+  fi
+  if command -v jq >/dev/null 2>&1 && [[ -f "$CLAUDE_SETTINGS_FILE" ]]; then
+    for dr_evt in UserPromptSubmit Stop SessionEnd; do
+      dr_n="$(jq -r "${HOOK_MATCH_JQ}"' [ (.hooks."'"$dr_evt"'" // [])[] | select(gn_functional) ] | length' \
+        "$CLAUDE_SETTINGS_FILE" 2>/dev/null || echo "?")"
+      ui_kv "$dr_evt" "${dr_n} goodnight entr$([[ "$dr_n" == "1" ]] && echo y || echo ies)"
+    done
+  fi
+
+  ui_section "Session markers" "$BUSY_DIR"
+  dr_before=0
+  if [[ -d "$BUSY_DIR" ]]; then
+    for dr_f in "$BUSY_DIR"/*; do [[ -f "$dr_f" ]] && dr_before=$((dr_before + 1)); done
+  fi
+  dr_reaped="$(reap_dead_markers)"
+  dr_live="$(count_busy_sessions)"
+  ui_kv "Markers found" "$dr_before"
+  ui_kv "Stale (reaped)" "$dr_reaped"
+  ui_kv "Live / working" "$dr_live"
+
+  ui_section "Agent activity" "Session logs watched for signs of work in progress"
+  dr_any_root=false
+  for dr_dir in "${AGENT_ACTIVITY_DIRS[@]}"; do
+    if [[ -d "$dr_dir" ]]; then
+      dr_any_root=true
+      ui_kv "Watching" "$dr_dir"
+    else
+      ui_kv "Absent" "$dr_dir"
+    fi
+  done
+  if [[ "$dr_any_root" != true ]]; then
+    print_warn "No agent session directories found — activity fallback unavailable."
+  else
+    dr_mt="$(newest_agent_activity)"
+    if [[ -n "$dr_mt" ]]; then
+      dr_age=$(($(date +%s) - dr_mt))
+      ui_kv "Last agent output" "$(elapsed_label "$dr_age") ago"
+    else
+      ui_kv "Last agent output" "none recorded"
+    fi
+    if transcript_active_within "$SMART_IDLE_SECONDS"; then
+      print_warn "Agent output written within the last $(elapsed_label "$SMART_IDLE_SECONDS") — a watch would still be waiting."
+    else
+      print_ok "No agent output in the last $(elapsed_label "$SMART_IDLE_SECONDS")."
+    fi
+  fi
+
+  ui_section "Watch configuration"
+  ui_kv "Mode" "$(hooks_installed && echo "smart (markers + transcripts)" || echo "smart (transcripts only — degraded)")"
+  ui_kv "Idle threshold" "$(elapsed_label "$SMART_IDLE_SECONDS")"
+  ui_kv "Stale window" "${SMART_STALE_MARKER_MINS}m"
+  ui_kv "Hard timeout" "${TIMEOUT_HOURS}h"
+  ui_kv "Log" "$([[ "$LOG_ENABLED" == true ]] && echo "$LOG_FILE" || echo "disabled")"
+
+  ui_section "Sleep readiness"
+  scan_assertions
+  if [[ "$PREFLIGHT_SCAN_OK" != true ]]; then
+    print_warn "pmset assertion scan unavailable — sleep readiness unknown."
+  elif [[ ${#PREFLIGHT_BLOCKERS[@]} -eq 0 ]]; then
+    print_ok "No sleep blockers."
+  else
+    print_warn "${#PREFLIGHT_BLOCKERS[@]} sleep blocker(s):"
+    for dr_entry in "${PREFLIGHT_BLOCKERS[@]}"; do
+      IFS='|' read -r dr_pid dr_name dr_type <<<"$dr_entry"
+      echo -e "    • ${BOLD}${dr_name}${RESET} (PID $dr_pid) — ${dr_type}"
+    done
+    print_step "Sleep is verified and retried ${SLEEP_MAX_ATTEMPTS}×, so these are survivable — but they will delay it."
+  fi
+  ui_kv "Power" "$(get_power_source)"
+
+  ui_section "Verdict"
+  if ((doctor_rc == 0)); then
+    if [[ "$dr_live" == "0" ]] && ! transcript_active_within "$SMART_IDLE_SECONDS"; then
+      ui_panel success "Healthy — would sleep" \
+        "Every agent is idle. Running goodnight now would sleep the Mac" \
+        "after $(elapsed_label "$SMART_IDLE_SECONDS") of continued quiet."
+    else
+      ui_panel info "Healthy — would wait" \
+        "${dr_live} session(s) still working." \
+        "Running goodnight now would wait for them, then sleep."
+    fi
+  else
+    ui_panel danger "Degraded" \
+      "goodnight would fall back to transcript-only detection." \
+      "It would still work, but less precisely. Fix the errors above."
+  fi
+  echo ""
+  exit "$doctor_rc"
 fi
 
 # ── --list mode ───────────────────────────────────────────────
@@ -2134,7 +2923,7 @@ if [[ "$SLEEP_NOW" == true ]]; then
     fi
     if [[ "$PREFLIGHT_SCAN_OK" != true ]]; then
       log_event "PREFLIGHT_SCAN_FAILED (sleep-now)"
-      if [[ "$FORCE" == false ]]; then
+      if [[ "$FORCE" == false && "$UNATTENDED" == false ]]; then
         if [[ "$STDIN_IS_TTY" == true ]]; then
           if ! ui_confirm "Sleep-blocker scan failed. Proceed anyway?"; then
             print_warn "Aborted by user."
@@ -2178,17 +2967,15 @@ if [[ "$SLEEP_NOW" == true ]]; then
   echo ""
   ui_panel success "Good night" "Requesting macOS sleep now."
   echo ""
-  log_event "SLEEP_ATTEMPT (sleep-now)"
-  if pmset sleepnow 2>/dev/null; then
+  if attempt_sleep "sleep-now"; then
     exit 0
-  elif osascript -e 'tell application "System Events" to sleep' 2>/dev/null; then
-    exit 0
-  else
-    print_error "Could not trigger sleep automatically."
-    print_warn "Run manually: ${BOLD}pmset sleepnow${RESET}"
-    log_event "SLEEP_FAILED (sleep-now)"
-    exit 1
   fi
+  print_error "The Mac did not sleep after ${SLEEP_MAX_ATTEMPTS} attempts."
+  print_warn "Something is holding a PreventSystemSleep assertion. Inspect with:"
+  print_step "${BOLD}pmset -g assertions${RESET}"
+  log_event "SLEEP_FAILED (sleep-now) attempts=${SLEEP_MAX_ATTEMPTS}"
+  notify_macos "goodnight could not sleep the Mac — see log"
+  exit 1
 fi
 
 # ── --smart mode: hook-based idle detection ──────────────────
@@ -2197,13 +2984,52 @@ fi
 # no process-exit waiting — sleep happens as soon as all sessions
 # have fired their Stop hook.
 if [[ "$SMART_WATCH" == true ]]; then
-  if ! hooks_installed; then
-    print_error "Claude Code hooks aren't installed — --smart mode can't detect idle sessions."
-    print_step "Install them once with: ${BOLD}goodnight --install-hooks${RESET}"
-    print_step "Or fall back to process-watch mode with: ${BOLD}goodnight --watch-pid${RESET}"
-    exit 1
+  SMART_HOOK_STATE="$(hooks_health)"
+
+  # Self-heal before giving up. A degraded integration is the expected
+  # steady state, not an exceptional one: settings.json is co-owned by
+  # Claude Code and by whatever else the user has wired into it, and our
+  # entries get rewritten by things that have no idea we exist.
+  if [[ "$SMART_HOOK_STATE" != "ok" && "$NO_REPAIR" == false ]]; then
+    print_warn "Claude Code hook integration degraded (${SMART_HOOK_STATE}) — repairing."
+    log_event "HOOKS_DEGRADED state=$SMART_HOOK_STATE"
+    if repair_claude_hooks; then
+      SMART_HOOK_STATE="$(hooks_health)"
+      print_ok "Hook integration repaired (${SMART_HOOK_STATE})."
+    else
+      SMART_HOOK_STATE="$(hooks_health)"
+    fi
+  elif [[ "$SMART_HOOK_STATE" == "ok" && "$NO_REPAIR" == false ]] && hooks_need_retag; then
+    # Functional but untagged: works today, becomes a duplicate-hook
+    # trap the next time anything reinstalls. Fix it quietly.
+    repair_claude_hooks >/dev/null 2>&1 || true
   fi
+
+  # Hooks repaired in this process only take effect for Claude sessions
+  # started afterwards — a session already running has its hook config
+  # loaded. Say so plainly rather than implying full coverage.
+  if [[ "$SMART_HOOK_STATE" == "ok" ]]; then
+    :
+  else
+    ui_panel warning "Running without Claude hook markers" \
+      "Hook state: ${SMART_HOOK_STATE}." \
+      "" \
+      "Falling back to transcript-activity detection, which watches" \
+      "agent output directly and needs no hooks. It is slower to notice" \
+      "a finished turn but cannot miss one that is still running." \
+      "" \
+      "Sleep will follow $(elapsed_label "$SMART_IDLE_SECONDS") with no agent output."
+    log_event "SMART_FALLBACK_TRANSCRIPT_ONLY state=$SMART_HOOK_STATE"
+  fi
+
   mkdir -p "$BUSY_DIR" 2>/dev/null || true
+  # Clear orphaned markers up front so the very first tick reports a
+  # truthful count instead of inheriting months of dead sessions.
+  SMART_REAPED="$(reap_dead_markers)"
+  if [[ "$SMART_REAPED" != "0" ]]; then
+    print_step "Cleared ${BOLD}${SMART_REAPED}${RESET} stale session marker(s)."
+    log_event "MARKERS_REAPED count=$SMART_REAPED"
+  fi
   # Run preflight + blocker handling first (same as default flow).
   if [[ "$SKIP_PREFLIGHT" == false ]]; then
     preflight_scan
@@ -2214,7 +3040,7 @@ if [[ "$SMART_WATCH" == true ]]; then
     fi
     if [[ "$PREFLIGHT_SCAN_OK" != true ]]; then
       log_event "PREFLIGHT_SCAN_FAILED (smart)"
-      if [[ "$FORCE" == false ]]; then
+      if [[ "$FORCE" == false && "$UNATTENDED" == false ]]; then
         if ! ui_confirm "Sleep-blocker scan failed. Proceed anyway?"; then
           print_warn "Aborted."
           exit 0
@@ -2235,9 +3061,15 @@ if [[ "$SMART_WATCH" == true ]]; then
     INITIAL_CAFF_PIDS=($(pgrep caffeinate 2>/dev/null || true))
   fi
 
-  ui_section "Smart watch" "Watching Claude hook markers until all sessions are idle."
-  print_step "Idle threshold: ${BOLD}${SMART_IDLE_SECONDS}s${RESET} (all Claude sessions must be idle this long)"
+  SMART_TIMEOUT_SECS=$((TIMEOUT_HOURS * 3600))
+
+  ui_section "Smart watch" "Waiting until every agent has finished, paused, or gone quiet."
+  print_step "Idle threshold: ${BOLD}$(elapsed_label "$SMART_IDLE_SECONDS")${RESET} with no session busy and no agent output"
+  print_step "Stale window:   ${BOLD}${SMART_STALE_MARKER_MINS}m${RESET} before a silent session stops counting"
+  print_step "Hard timeout:   ${BOLD}${TIMEOUT_HOURS}h${RESET}"
   print_step "Busy markers:   ${BOLD}$BUSY_DIR${RESET}"
+  print_step "Agent logs:     ${BOLD}${AGENT_ACTIVITY_DIRS[*]}${RESET}"
+  [[ "$LOG_ENABLED" == true ]] && print_step "Log:            ${BOLD}${LOG_FILE}${RESET}"
   print_step "Press ${BOLD}Ctrl+C${RESET} to cancel"
   echo ""
 
@@ -2246,12 +3078,27 @@ if [[ "$SMART_WATCH" == true ]]; then
   if ! acquire_goodnight_lock; then
     exit 1
   fi
-  log_event "SMART_WATCH_START busy_count=$(count_busy_sessions)"
+  log_event "SMART_WATCH_START busy_count=$(count_busy_sessions) hooks=$SMART_HOOK_STATE idle=${SMART_IDLE_SECONDS}s stale=${SMART_STALE_MARKER_MINS}m timeout=${TIMEOUT_HOURS}h"
   WATCH_STARTED=true
   smart_watch_loop
+  SMART_WATCH_RC=$?
   WATCH_STARTED=false
   clear_line
-  log_event "SMART_WATCH_IDLE — proceeding to sleep"
+  if ((SMART_WATCH_RC == 3)); then
+    # The Mac already slept by other means. Releasing caffeinate and
+    # issuing another sleep here would put it straight back down in
+    # the user's hands, seconds after they woke it.
+    log_event "SMART_WATCH_EXIT_ALREADY_SLEPT"
+    notify_macos "Mac already slept — goodnight stood down"
+    print_done "Nothing to do — the Mac slept on its own."
+    exit 0
+  elif ((SMART_WATCH_RC == 2)); then
+    log_event "SMART_WATCH_TIMEOUT — proceeding to sleep"
+    notify_macos "goodnight timeout reached — sleeping"
+  else
+    log_event "SMART_WATCH_IDLE — proceeding to sleep"
+    notify_macos "All agents idle — sleeping"
+  fi
 
   # Reuse the existing release-caffeinate + sleep sequence from the
   # default watch flow. Jump there by falling through — set
@@ -2331,7 +3178,7 @@ if [[ "${SMART_WATCH_DONE:-false}" != true ]]; then
 
     if [[ "$PREFLIGHT_SCAN_OK" != true ]]; then
       log_event "PREFLIGHT_SCAN_FAILED"
-      if [[ "$FORCE" == false ]]; then
+      if [[ "$FORCE" == false && "$UNATTENDED" == false ]]; then
         if [[ "$STDIN_IS_TTY" == true ]]; then
           if ! ui_confirm "Sleep-blocker scan failed. Proceed anyway?"; then
             print_warn "Aborted by user. Claude is still running; caffeinate untouched."
@@ -2552,15 +3399,14 @@ sleep "$DELAY_SECS"
 echo ""
 ui_panel success "Good night" "Requesting macOS sleep now."
 echo ""
-log_event "SLEEP_ATTEMPT"
 
-if pmset sleepnow 2>/dev/null; then
+if attempt_sleep "watch"; then
   exit 0
-elif osascript -e 'tell application "System Events" to sleep' 2>/dev/null; then
-  exit 0
-else
-  print_error "Could not trigger sleep automatically."
-  print_warn "Run manually: ${BOLD}pmset sleepnow${RESET}"
-  log_event "SLEEP_FAILED"
-  exit 1
 fi
+
+print_error "The Mac did not sleep after ${SLEEP_MAX_ATTEMPTS} attempts."
+print_warn "Something is holding a PreventSystemSleep assertion. Inspect with:"
+print_step "${BOLD}pmset -g assertions${RESET}"
+log_event "SLEEP_FAILED attempts=${SLEEP_MAX_ATTEMPTS}"
+notify_macos "goodnight could not sleep the Mac — see log"
+exit 1
