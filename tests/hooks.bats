@@ -118,32 +118,5 @@ EOF
   [ "$output" = "0" ]
 }
 
-@test "count_busy_sessions: returns 0 when directory is empty" {
-  source <(sed -n '/^count_busy_sessions() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")
-  mkdir -p "$BUSY_DIR"
-  run count_busy_sessions
-  [ "$output" = "0" ]
-}
-
-@test "count_busy_sessions: returns the number of marker files" {
-  source <(sed -n '/^count_busy_sessions() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")
-  mkdir -p "$BUSY_DIR"
-  touch "$BUSY_DIR/session-a" "$BUSY_DIR/session-b" "$BUSY_DIR/session-c"
-  run count_busy_sessions
-  [ "$output" = "3" ]
-}
-
-@test "count_busy_sessions: honors the configurable stale threshold (F-08)" {
-  # F-08 moved the default threshold to 24h and made it configurable
-  # via SAC_STALE_MARKER_MINUTES. Exercise the reap by setting a
-  # short threshold in the test env.
-  SMART_STALE_MARKER_MINS=120 source <(sed -n '/^count_busy_sessions() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")
-  mkdir -p "$BUSY_DIR"
-  touch "$BUSY_DIR/fresh"
-  # Backdate a marker by 3 hours — stale under the 2h override
-  touch -t "$(date -v-3H +%Y%m%d%H%M)" "$BUSY_DIR/stale" 2>/dev/null
-  SMART_STALE_MARKER_MINS=120 run count_busy_sessions
-  [ "$output" = "1" ]
-  [ ! -f "$BUSY_DIR/stale" ]
-  [ -f "$BUSY_DIR/fresh" ]
-}
+# Marker counting now depends on the transcript-corroborated liveness
+# model, which has its own dedicated file. See tests/session-activity.bats.

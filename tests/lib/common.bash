@@ -67,3 +67,21 @@ assert_not_contains() {
     return 1
   fi
 }
+
+# Lift selected function definitions (plus the shared jq predicate) out
+# of the real script into a sourceable file, so unit tests exercise the
+# shipped implementation instead of a copy that can drift from it.
+#
+# Usage: extract_from_script "$BATS_TEST_TMPDIR/fns.sh" hooks_health count_busy_sessions
+extract_from_script() {
+  local out="$1"
+  shift
+  : >"$out"
+  sed -n "/^HOOK_MATCH_JQ=/,/;'\$/p" "$REPO_ROOT/sleep-after-claude" >>"$out"
+  local fn
+  for fn in "$@"; do
+    sed -n "/^${fn}() {\$/,/^}\$/p" "$REPO_ROOT/sleep-after-claude" >>"$out"
+    printf '\n' >>"$out"
+  done
+  [[ -s "$out" ]]
+}

@@ -10,14 +10,19 @@ load 'lib/common'
 
 setup() {
   setup_sandbox
-  # Extract log_event + its companion LOG_WRITE_FAILED=false line.
-  awk '
-    /^LOG_WRITE_FAILED=false$/ { inblock=1 }
-    inblock { print }
-    inblock && /^}$/ { inblock=0 }
-  ' "$REPO_ROOT/sleep-after-claude" > "$BATS_TEST_TMPDIR/log_event.sh"
-  # Sanity: must have extracted non-trivial content.
-  [ -s "$BATS_TEST_TMPDIR/log_event.sh" ]
+  # Extract log_event and the rotation helper it calls, plus their
+  # companion state flags. Pulled from the real script so the test
+  # fails if the implementation drifts from the contract.
+  {
+    echo 'LOG_WRITE_FAILED=false'
+    echo 'LOG_ROTATE_CHECKED=false'
+    echo 'LOG_MAX_BYTES=2097152'
+    sed -n '/^maybe_rotate_log() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
+    sed -n '/^log_event() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
+  } >"$BATS_TEST_TMPDIR/log_event.sh"
+  # Sanity: must have extracted both functions.
+  grep -q '^log_event() {' "$BATS_TEST_TMPDIR/log_event.sh"
+  grep -q '^maybe_rotate_log() {' "$BATS_TEST_TMPDIR/log_event.sh"
 }
 
 @test "F-07: log_event writes successfully to a writable path" {
