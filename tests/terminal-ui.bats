@@ -102,3 +102,34 @@ setup() {
   assert_contains "$output" "terminal-ui: runtime gum/glow shim fixture OK"
   assert_contains "$output" "terminal-ui: installer gum/glow shim fixture OK"
 }
+
+@test "terminal-ui: line clearing erases to end of line, not a fixed width" {
+  # Padding to a fixed 72 columns fails two ways: anything longer leaves
+  # a tail, and on a narrower terminal the padding itself wraps and
+  # creates a second line the next \r cannot reach. Both were observed
+  # as duplicated spinner rows with fragments of earlier output beside
+  # them.
+  run grep -n 'printf "\\r%-72s\\r"\|printf "\\r%-80s\\r"' "$REPO_ROOT/sleep-after-claude"
+  [ "$status" -ne 0 ]
+  run grep -c 'printf "\\r\\033\[K"' "$REPO_ROOT/sleep-after-claude"
+  [ "$output" -ge 2 ]
+}
+
+@test "terminal-ui: every spinner write clears before drawing" {
+  # A spinner that only pads trailing spaces cannot shorten a line.
+  while IFS= read -r line; do
+    case "$line" in
+      *'\r\033[K'*) : ;;
+      *) echo "spinner write without erase: $line" >&2; return 1 ;;
+    esac
+  done < <(grep -o 'printf "\\r[^"]*"' "$REPO_ROOT/sleep-after-claude")
+}
+
+@test "terminal-ui: cancelling smart mode does not report a PID it never had" {
+  # Smart mode watches markers and session logs; it has no TARGET_PID,
+  # so the old handler logged "PID unknown" for the default mode.
+  block="$(sed -n '/^on_interrupt() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")"
+  assert_contains "$block" 'CANCELLED mode=smart'
+  assert_contains "$block" 'CANCELLED mode=watch-pid'
+  assert_not_contains "$block" 'CANCELLED while watching PID'
+}

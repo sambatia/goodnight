@@ -1308,8 +1308,16 @@ Logging is on. Default log: `~/.local/state/sleep-after-claude.log`
 HELP
 }
 
+# Erase the current line.
+#
+# `\033[K` clears from the cursor to the end of the line, whatever is
+# there. Overwriting a fixed 72 columns with spaces fails two ways:
+# anything longer leaves a tail behind, and on a terminal narrower than
+# 72 the padding itself wraps and creates a second line the next `\r`
+# cannot reach. Both showed up in practice as duplicated spinner rows
+# with fragments of earlier output stranded beside them.
 clear_line() {
-  [[ "$USE_SPINNER" == true ]] && printf "\r%-72s\r" " "
+  [[ "$USE_SPINNER" == true ]] && printf "\r\033[K"
 }
 
 is_integer() { [[ "$1" =~ ^[0-9]+$ ]]; }
@@ -2340,7 +2348,7 @@ wait_for_ac_power() {
     if [[ "$USE_SPINNER" == true ]]; then
       # Static format string; every dynamic value passes through %s so
       # stray `%` characters in $pct / $gauge can never corrupt it.
-      printf "\r  %s%s%s  %sWaiting for charger…%s  %ds  %s%s%s      " \
+      printf "\r\033[K  %s%s%s  %sWaiting for charger…%s  %ds  %s%s%s" \
         "$CYAN" "${frames[$tick]}" "$RESET" \
         "$DIM" "$RESET" \
         "$elapsed" \
@@ -2357,7 +2365,7 @@ wait_for_ac_power() {
   done
 
   # Clear the spinner line.
-  [[ "$USE_SPINNER" == true ]] && printf "\r%-80s\r" " "
+  [[ "$USE_SPINNER" == true ]] && printf "\r\033[K"
 
   pct="$(get_battery_percent)"
   gauge="$(render_battery_gauge "$pct")"
@@ -3066,7 +3074,7 @@ smart_watch_loop() {
       fi
       remaining=$((SMART_IDLE_SECONDS - idle_for))
       if [[ "$USE_SPINNER" == true ]]; then
-        printf "\r  %s%s%s  %sAll agents idle…%s  sleeping in %s      " \
+        printf "\r\033[K  %s%s%s  %sAll agents idle…%s  sleeping in %s" \
           "$GREEN" "${frames[$tick]}" "$RESET" \
           "$DIM" "$RESET" \
           "$(elapsed_label "$remaining")"
@@ -3094,7 +3102,7 @@ smart_watch_loop() {
         else
           why="agent output still being written"
         fi
-        printf "\r  %s%s%s  %sWaiting — %s…%s  %s elapsed      " \
+        printf "\r\033[K  %s%s%s  %sWaiting — %s…%s  %s elapsed" \
           "$CYAN" "${frames[$tick]}" "$RESET" \
           "$DIM" "$why" "$RESET" \
           "$(elapsed_label "$elapsed")"
@@ -3414,8 +3422,16 @@ on_interrupt() {
   clear_line
   echo ""
   if [[ "$WATCH_STARTED" == true ]]; then
-    print_warn "Cancelled — machine will ${BOLD}not${RESET} sleep. Claude is still running."
-    log_event "CANCELLED while watching PID ${TARGET_PID:-unknown}"
+    # Smart mode watches markers and session logs, not a PID, so the old
+    # wording logged "PID unknown" for what is now the default mode, and
+    # named Claude alone when the watch covers several agents.
+    if [[ "$SMART_WATCH" == true ]]; then
+      print_warn "Cancelled — machine will ${BOLD}not${RESET} sleep. Agents left running."
+      log_event "CANCELLED mode=smart busy=$(count_busy_sessions)"
+    else
+      print_warn "Cancelled — machine will ${BOLD}not${RESET} sleep. PID ${TARGET_PID:-unknown} still running."
+      log_event "CANCELLED mode=watch-pid pid=${TARGET_PID:-unknown}"
+    fi
   else
     print_warn "Cancelled."
   fi
@@ -4130,7 +4146,7 @@ if [[ "${SMART_WATCH_DONE:-false}" != true ]]; then
     if [[ "$USE_SPINNER" == true ]]; then
       # Static format; all dynamics go through %s so stray `%` can't
       # corrupt the format string (same safety pattern as wait_for_ac_power).
-      printf "\r  %s%s%s  %sWaiting for PID %s…%s  %s elapsed     " \
+      printf "\r\033[K  %s%s%s  %sWaiting for PID %s…%s  %s elapsed" \
         "$CYAN" "${FRAMES[$TICK]}" "$RESET" \
         "$DIM" "$TARGET_PID" "$RESET" \
         "$(elapsed_label "$ELAPSED")"
