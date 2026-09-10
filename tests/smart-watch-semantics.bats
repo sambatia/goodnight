@@ -16,9 +16,41 @@ load 'lib/common'
   [ "$status" -eq 0 ]
 }
 
-@test "the watch loop requires marker AND transcript quiet before sleeping" {
-  run grep -n 'busy" == "0" && "\$recent_write" == false' "$REPO_ROOT/sleep-after-claude"
-  [ "$status" -eq 0 ]
+@test "the watch loop requires marker AND session-log quiet before sleeping" {
+  block="$(sed -n '/^smart_watch_loop() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")"
+  # A live marker pins last_activity to now, so the countdown cannot
+  # start while any session is busy...
+  assert_contains "$block" 'if [[ "$busy" != "0" ]]; then'
+  assert_contains "$block" 'last_activity=$now'
+  # ...and with none busy, the newest session-log mtime governs.
+  assert_contains "$block" 'activity_ts="$(newest_agent_activity)"'
+  assert_contains "$block" 'idle_for=$((now - last_activity))'
+}
+
+@test "the idle window is measured once, from the last write" {
+  # Regression guard for the doubled wait: a boolean "written recently"
+  # check only goes false after a full window has already elapsed, so
+  # starting the countdown from there costs a second one.
+  block="$(sed -n '/^smart_watch_loop() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")"
+  assert_not_contains "$block" 'transcript_active_within "$SMART_IDLE_SECONDS"'
+  assert_contains "$block" 'if ((idle_for >= SMART_IDLE_SECONDS)); then'
+}
+
+@test "health requires all three hook events, so old installs get upgraded" {
+  block="$(sed -n '/^hooks_health() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")"
+  assert_contains "$block" 'ups > 0 && stop > 0 && send > 0'
+  assert_contains "$block" 'SessionEnd'
+}
+
+@test "health asks whether the command still works, ownership asks whose it is" {
+  # Matching health on the tag alone would let an entry whose command
+  # was replaced report healthy and skip repair.
+  block="$(sed -n '/^hooks_health() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")"
+  assert_contains "$block" 'select(gn_functional)'
+  assert_not_contains "$block" 'select(gn_owned)'
+  # Install/uninstall must still recognise a mangled entry as ours.
+  run grep -c 'select(gn_owned | not)' "$REPO_ROOT/sleep-after-claude"
+  [ "$output" -ge 6 ]
 }
 
 @test "the cold-start hold is gone" {

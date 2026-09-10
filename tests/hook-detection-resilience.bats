@@ -40,6 +40,13 @@ write_settings() {
         $tag
         "hooks": [{ "type": "command", "command": "sid=\$(jq -r .session_id); rm -f \"\$HOME/.local/state/goodnight/busy\"/\"\$sid\"; exit 0 # goodnight-hook" }]
       }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        $tag
+        "hooks": [{ "type": "command", "command": "sid=\$(jq -r .session_id); rm -f \"\$HOME/.local/state/goodnight/busy\"/\"\$sid\"; exit 0 # goodnight-hook" }]
+      }
     ]
   }
 }
@@ -87,6 +94,9 @@ health() {
       { "matcher": "", "hooks": [{ "type": "command", "command": "touch \"$HOME/.local/state/goodnight/busy\"/\"$sid\"" }] }
     ],
     "Stop": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "rm -f \"$HOME/.local/state/goodnight/busy\"/\"$sid\"" }] }
+    ],
+    "SessionEnd": [
       { "matcher": "", "hooks": [{ "type": "command", "command": "rm -f \"$HOME/.local/state/goodnight/busy\"/\"$sid\"" }] }
     ]
   }
@@ -181,4 +191,70 @@ JSON
   [ "$status" -eq 0 ]
   run health
   [ "$output" = "missing" ] || [ "$output" = "nofile" ]
+}
+
+@test "health: an entry keeping only its tag, with the command gone, is NOT healthy" {
+  # The original bug wearing the opposite mask. Matching on the tag
+  # alone would report healthy, skip repair, and leave an active turn
+  # markerless for the watcher to sleep over.
+  cat >"$CLAUDE_SETTINGS_FILE" <<'JSON'
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "matcher": "", "_managed_by": "goodnight", "hooks": [{ "type": "command", "command": "some-other-tool --replaced-us" }] }
+    ],
+    "Stop": [
+      { "matcher": "", "_managed_by": "goodnight", "hooks": [{ "type": "command", "command": "some-other-tool --replaced-us" }] }
+    ],
+    "SessionEnd": [
+      { "matcher": "", "_managed_by": "goodnight", "hooks": [{ "type": "command", "command": "some-other-tool --replaced-us" }] }
+    ]
+  }
+}
+JSON
+  run health
+  [ "$output" = "missing" ]
+}
+
+@test "ownership still covers a mangled entry so it can be cleaned up" {
+  # Health says broken, but the entry is still ours to replace — a
+  # reinstall must not leave the wreckage behind beside a fresh copy.
+  cat >"$CLAUDE_SETTINGS_FILE" <<'JSON'
+{
+  "hooks": {
+    "Stop": [
+      { "matcher": "", "_managed_by": "goodnight", "hooks": [{ "type": "command", "command": "mangled" }] }
+    ]
+  }
+}
+JSON
+  run bash "$REPO_ROOT/sleep-after-claude" --install-hooks
+  [ "$status" -eq 0 ]
+  run jq '[.hooks.Stop[]] | length' "$CLAUDE_SETTINGS_FILE"
+  [ "$output" = "1" ]
+  run health
+  [ "$output" = "ok" ]
+}
+
+@test "health: an install predating SessionEnd reports partial so repair reaches it" {
+  # Otherwise an upgraded machine keeps leaking a marker on every quit
+  # or crash until the stale window expires, and never finds out.
+  write_settings tagged
+  run bash -c "cd '$HOME' && jq 'del(.hooks.SessionEnd)' '$CLAUDE_SETTINGS_FILE' > t && mv t '$CLAUDE_SETTINGS_FILE'"
+  run health
+  [ "$output" = "partial" ]
+}
+
+@test "a two-hook install is upgraded to three by repair" {
+  write_settings tagged
+  jq 'del(.hooks.SessionEnd)' "$CLAUDE_SETTINGS_FILE" > "$BATS_TEST_TMPDIR/t" && mv "$BATS_TEST_TMPDIR/t" "$CLAUDE_SETTINGS_FILE"
+  shim pgrep 'exit 1'
+  run env SAC_IDLE_SECONDS=1 bash "$REPO_ROOT/sleep-after-claude" \
+    --smart --no-preflight --allow-battery --dry-run \
+    --no-auto-caffeinate --no-sound --no-log
+  [ "$status" -eq 0 ]
+  run health
+  [ "$output" = "ok" ]
+  run jq '[.hooks.SessionEnd[]] | length' "$CLAUDE_SETTINGS_FILE"
+  [ "$output" = "1" ]
 }

@@ -55,6 +55,9 @@ doctor() {
     ],
     "Stop": [
       { "matcher": "", "hooks": [{ "type": "command", "command": "rm -f x # goodnight-hook" }] }
+    ],
+    "SessionEnd": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "rm -f x # goodnight-hook" }] }
     ]
   }
 }

@@ -20,7 +20,7 @@ macOS Bash utility `sleep-after-claude` (aliased to `goodnight`) that watches a 
 - `scripts/check-parity.sh` — verifies the embedded payload matches the standalone script. See "Parity invariant" below.
 - `.githooks/pre-commit` — opt-in legacy hook that runs the parity check when either script is staged. Enable with `git config core.hooksPath .githooks`. Superseded by the `pre-commit` framework config at `.pre-commit-config.yaml`.
 - `.pre-commit-config.yaml` — canonical pre-commit config. Runs parity + `shellcheck` + `shfmt` + repo hygiene on every commit.
-- `tests/` — bats-core regression suite (191 tests). Each `*.bats` file's header comment names the audit finding(s) or subsystem it protects. Live counts: `bats tests/ --count` and `ls tests/*.bats | wc -l`.
+- `tests/` — bats-core regression suite (199 tests). Each `*.bats` file's header comment names the audit finding(s) or subsystem it protects. Live counts: `bats tests/ --count` and `ls tests/*.bats | wc -l`.
 - `README.md` — user-facing install/usage guide + documented escape hatches for CDN staleness, SHA pinning, and hook opt-out.
 
 ## Parity invariant (critical)
@@ -110,7 +110,12 @@ The rule that follows: **detection keys on the command string, not on annotation
 
 `HOOK_MATCH_JQ` defines the shared predicate — a hook entry is ours if any of its commands matches `goodnight-hook|goodnight/busy`, **or** it carries the `_managed_by` tag. It is used by detection, install de-duplication, uninstall, and repair alike, so those four can never disagree about what counts as ours.
 
-`hooks_health` reports one word: `ok` (both `UserPromptSubmit` and `Stop` present), `partial`, `missing`, `nofile`, `badjson`, or `nojq`. `hooks_installed` is true only for `ok`. **`partial` must never count as installed** — without `UserPromptSubmit` no marker is ever written, so a marker-trusting watcher reads a busy machine as idle and sleeps it mid-task. Fail toward staying awake.
+`HOOK_MATCH_JQ` defines **two** predicates, and the distinction matters:
+
+- `gn_functional` — does the entry still carry a command that does the job? This is what *health* asks. The tag alone is not enough: an entry whose command was emptied or replaced would otherwise report healthy, skip repair, and leave an active turn markerless for the watcher to sleep over. That is the original bug wearing the opposite mask.
+- `gn_owned` — is the entry ours to rewrite or remove? Broader on purpose, because a mangled entry we installed is still ours to clean up. Install de-duplication and uninstall use this one.
+
+`hooks_health` reports one word: `ok` (all three of `UserPromptSubmit`, `Stop`, `SessionEnd` functional), `partial`, `missing`, `nofile`, `badjson`, or `nojq`. `hooks_installed` is true only for `ok`. **SessionEnd counts toward health** so that an install predating it reports `partial`, routes through repair once, and comes out whole — otherwise an upgraded machine keeps leaking a marker on every quit or crash and never finds out. **`partial` must never count as installed** — without `UserPromptSubmit` no marker is ever written, so a marker-trusting watcher reads a busy machine as idle and sleeps it mid-task. Fail toward staying awake.
 
 `repair_claude_hooks` fixes a degraded install in place and runs automatically on the smart path (`--no-repair` opts out):
 
@@ -377,7 +382,7 @@ Fixed:
 - **Unattended by default.** Logging on, update check opt-in, every prompt time-bounded, blockers no longer abort when nobody is there to answer.
 - **`--doctor`.** The diagnostic that would have caught this from the outside on day one.
 
-Tests: 133 → 191. New files: `hook-detection-resilience.bats`, `session-activity.bats`, `verified-sleep.bats`, `doctor.bats`. Rewritten: `smart-watch-semantics.bats`, `smart-watch-runtime.bats`, `default-mode.bats`.
+Tests: 133 → 199. New files: `hook-detection-resilience.bats`, `session-activity.bats`, `verified-sleep.bats`, `doctor.bats`. Rewritten: `smart-watch-semantics.bats`, `smart-watch-runtime.bats`, `default-mode.bats`.
 
 **Deliberately broken contracts** (old tests asserted these; they were the bugs): the F-01 cold-start hold, the F-08 24-hour blind reaper, and PID-mode fallback on hook-detection failure. Each replaced by a test asserting the new contract rather than deleted.
 

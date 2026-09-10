@@ -38,6 +38,7 @@ setup() {
     sed -n '/^elapsed_label() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^transcript_for_session() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^transcript_active_within() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
+    sed -n '/^newest_agent_activity() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^reap_dead_markers() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^count_busy_sessions() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^smart_watch_loop() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
@@ -105,14 +106,27 @@ stop_loop() {
   assert_not_contains "$output" "LOOP_RETURNED"
 }
 
-@test "recent agent output blocks sleep even with no marker present" {
+@test "continuing agent output blocks sleep even with no marker present" {
   # The hooks-are-broken safety net. No marker exists, so a
-  # marker-only watcher would sleep immediately; the transcript write
-  # is what stops it.
-  echo '{}' >"$CLAUDE_PROJECTS_DIR/proj/unmarked.jsonl"
+  # marker-only watcher would sleep immediately; it is the stream of
+  # writes that has to hold it off. Keep writing for longer than the
+  # idle window and the loop must never conclude.
+  local f="$CLAUDE_PROJECTS_DIR/proj/unmarked.jsonl"
+  echo '{}' >"$f"
+  (
+    local i=0
+    while ((i < 16)); do
+      echo '{}' >>"$f"
+      sleep 0.5
+      i=$((i + 1))
+    done
+  ) &
+  local writer_pid=$!
   drive_loop_bg "$BATS_TEST_TMPDIR/out"
-  sleep 5
+  sleep 6
   stop_loop
+  kill "$writer_pid" 2>/dev/null || true
+  wait "$writer_pid" 2>/dev/null || true
   run cat "$BATS_TEST_TMPDIR/out"
   assert_not_contains "$output" "LOOP_RETURNED"
 }
@@ -207,9 +221,29 @@ JSON
 }
 
 @test "the session-log scan is skipped while a marker already says busy" {
-  # The scan stats every transcript under every activity root, and
+  # The scan stats every session log under every activity root, and
   # those accumulate forever. It must not run when its answer cannot
   # change the outcome.
   block="$(sed -n '/^smart_watch_loop() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")"
-  assert_contains "$block" '[[ "$busy" == "0" ]] && transcript_active_within'
+  assert_contains "$block" 'if [[ "$busy" != "0" ]]; then'
+  assert_contains "$block" 'last_activity=$now'
+  assert_contains "$block" 'activity_ts="$(newest_agent_activity)"'
+}
+
+@test "sleep follows ONE idle window after the last write, not two" {
+  # The boolean "was anything written recently" check only went false
+  # once a log had already been quiet for a full --idle, and the
+  # countdown then started from there — so the wait was ~2x--idle.
+  # With SMART_IDLE_SECONDS=2, a log written at T must sleep near T+2,
+  # not near T+4.
+  echo '{}' >"$CLAUDE_PROJECTS_DIR/proj/recent.jsonl"
+  local t0 t1 elapsed
+  t0=$(date +%s)
+  run drive_loop
+  t1=$(date +%s)
+  elapsed=$((t1 - t0))
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "LOOP_RETURNED rc=0"
+  # Generous ceiling; the doubled behaviour took >=4s plus poll slack.
+  [ "$elapsed" -lt 4 ]
 }

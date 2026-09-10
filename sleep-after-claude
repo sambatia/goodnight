@@ -441,14 +441,28 @@ ui_choose() {
     # default" rather than blocking on a menu nobody will answer.
     return 1
   fi
+  # The first entry is the documented safe default, and it is what an
+  # unanswered prompt must resolve to. Callers order their menus so
+  # that this is the non-destructive choice.
+  local safe_default="${items[0]%%|*}"
   if have_gum; then
     local -a labels=()
     local item
     for item in "${items[@]}"; do
       labels+=("${item#*|}")
     done
-    local chosen_label
-    chosen_label="$(gum choose --header "$header" --timeout "${PROMPT_TIMEOUT_SECS}s" -- "${labels[@]}")" || return 130
+    local chosen_label rc
+    chosen_label="$(gum choose --header "$header" --timeout "${PROMPT_TIMEOUT_SECS}s" -- "${labels[@]}")"
+    rc=$?
+    # gum exits 124 on timeout. Passing that through as a failure threw
+    # the safe default away and handed the caller an empty answer, which
+    # it reads as abort — so a prompt left unattended kept the Mac awake,
+    # which is precisely what the timeout was added to prevent.
+    if ((rc == 124)); then
+      echo "$safe_default"
+      return 0
+    fi
+    ((rc == 0)) || return 130
     # Map label back to key
     for item in "${items[@]}"; do
       if [[ "${item#*|}" == "$chosen_label" ]]; then
@@ -459,15 +473,29 @@ ui_choose() {
     return 1
   fi
   # Fallback: render labels + read a single-letter key.
+  #
+  # Every byte of prompt UI goes to stderr. This function's stdout is
+  # command-substituted by the caller, so the menu itself was being
+  # captured as part of the answer — the header and labels came back
+  # glued to the chosen key, matched no case arm, and the blocker menu
+  # aborted whatever the user picked.
   local item
-  echo "  $header"
+  echo "  $header" >&2
   for item in "${items[@]}"; do
     local key="${item%%|*}" label="${item#*|}"
-    echo -e "    ${CYAN}[${key:0:1}]${RESET} ${label}"
+    echo -e "    ${CYAN}[${key:0:1}]${RESET} ${label}" >&2
   done
   local choice
-  printf "  Choice: "
-  read -r choice
+  printf "  Choice: " >&2
+  # Bounded here too. Without gum installed this read was unbounded, so
+  # the time-bounded-prompt contract held only on machines that happened
+  # to have gum.
+  if ! read -r -t "$PROMPT_TIMEOUT_SECS" choice; then
+    echo "" >&2
+    print_warn "No answer in ${PROMPT_TIMEOUT_SECS}s — taking the safe default." >&2
+    echo "$safe_default"
+    return 0
+  fi
   choice="$(echo "$choice" | tr '[:upper:]' '[:lower:]' | cut -c1)"
   for item in "${items[@]}"; do
     local key="${item%%|*}"
@@ -1750,9 +1778,22 @@ check_for_update() {
 # preserving the command it annotates. That is not hypothetical — it is
 # exactly how this command silently stopped working. Detection must key on
 # the payload that has to survive for the hook to run at all.
-HOOK_MATCH_JQ='def gn_entry:
-    ([ (.hooks // [])[] | (.command // "") ] | any(test("goodnight-hook|goodnight/busy")))
-    or (._managed_by == "goodnight");'
+# Two questions, deliberately distinct:
+#
+#   gn_functional  does this entry still carry a command that does the
+#                  job? This is what health must ask. The tag alone is
+#                  not enough: an entry whose command was emptied or
+#                  replaced would otherwise report healthy, skip repair,
+#                  and leave an active turn markerless for the watcher
+#                  to sleep over — the original bug wearing the opposite
+#                  mask.
+#
+#   gn_owned       is this entry ours to rewrite or remove? Broader on
+#                  purpose, because a mangled entry we installed is
+#                  still ours to clean up, so ownership accepts the tag.
+HOOK_MATCH_JQ='def gn_cmds: [ (.hooks // [])[] | (.command // "") ];
+  def gn_functional: (gn_cmds | any(test("goodnight-hook|goodnight/busy")));
+  def gn_owned: gn_functional or (._managed_by == "goodnight");'
 
 # Report the health of goodnight'"'"'s Claude Code hook integration.
 # Echoes exactly one word:
@@ -1778,8 +1819,9 @@ hooks_health() {
   # `[…] | length, […] | length` would parse as one pipeline and emit
   # the wrong pair.
   counts="$(jq -r "${HOOK_MATCH_JQ}"'
-    ([ (.hooks.UserPromptSubmit // [])[] | select(gn_entry) ] | length),
-    ([ (.hooks.Stop            // [])[] | select(gn_entry) ] | length)
+    ([ (.hooks.UserPromptSubmit // [])[] | select(gn_functional) ] | length),
+    ([ (.hooks.Stop            // [])[] | select(gn_functional) ] | length),
+    ([ (.hooks.SessionEnd      // [])[] | select(gn_functional) ] | length)
   ' "$CLAUDE_SETTINGS_FILE" 2>/dev/null)" || {
     echo badjson
     return
@@ -1788,16 +1830,22 @@ hooks_health() {
     echo badjson
     return
   }
-  local ups stop
+  local ups stop send
   ups="$(printf '%s\n' "$counts" | sed -n 1p)"
   stop="$(printf '%s\n' "$counts" | sed -n 2p)"
-  [[ "$ups" =~ ^[0-9]+$ && "$stop" =~ ^[0-9]+$ ]] || {
+  send="$(printf '%s\n' "$counts" | sed -n 3p)"
+  [[ "$ups" =~ ^[0-9]+$ && "$stop" =~ ^[0-9]+$ && "$send" =~ ^[0-9]+$ ]] || {
     echo badjson
     return
   }
-  if ((ups > 0 && stop > 0)); then
+  # SessionEnd counts toward health, not just the other two. An install
+  # predating it reports `partial`, which routes it through repair once
+  # and leaves it whole. Otherwise an upgraded machine keeps leaking a
+  # marker on every quit or crash until the stale window expires, and
+  # never finds out it is missing the hook that would prevent it.
+  if ((ups > 0 && stop > 0 && send > 0)); then
     echo ok
-  elif ((ups > 0 || stop > 0)); then
+  elif ((ups > 0 || stop > 0 || send > 0)); then
     echo partial
   else
     echo missing
@@ -1822,7 +1870,7 @@ hooks_need_retag() {
   [[ -f "$CLAUDE_SETTINGS_FILE" ]] || return 1
   jq -e "${HOOK_MATCH_JQ}"'
     [ ((.hooks.UserPromptSubmit // []) + (.hooks.Stop // []) + (.hooks.SessionEnd // []))[]
-      | select(gn_entry) | select(._managed_by != "goodnight") ] | length > 0
+      | select(gn_owned) | select(._managed_by != "goodnight") ] | length > 0
   ' "$CLAUDE_SETTINGS_FILE" >/dev/null 2>&1
 }
 
@@ -1849,7 +1897,7 @@ repair_claude_hooks() {
     local tmp
     tmp="$(mktemp)" || return 1
     if jq "${HOOK_MATCH_JQ}"'
-      def retag: if gn_entry then (._managed_by = "goodnight") else . end;
+      def retag: if gn_owned then (._managed_by = "goodnight") else . end;
       .hooks = (.hooks // {})
       | (if (.hooks.UserPromptSubmit | type) == "array" then .hooks.UserPromptSubmit |= map(retag) else . end)
       | (if (.hooks.Stop            | type) == "array" then .hooks.Stop            |= map(retag) else . end)
@@ -2062,7 +2110,7 @@ install_claude_hooks() {
   # replace rather than accumulate.
   #
   # De-duplication matches on the command sentinel as well as the
-  # ._managed_by tag (gn_entry). Matching on the tag alone is what would
+  # ._managed_by tag (gn_owned). Matching on the tag alone is what would
   # turn a repair into a duplicate: an entry that had lost its tag would
   # survive the strip, then the fresh copy would be appended beside it
   # and every prompt would fire the hook twice.
@@ -2071,9 +2119,9 @@ install_claude_hooks() {
   if ! jq --arg prompt_cmd "$prompt_cmd" --arg stop_cmd "$stop_cmd" --arg end_cmd "$end_cmd" \
     "${HOOK_MATCH_JQ}"'
     .hooks = (.hooks // {})
-    | .hooks.UserPromptSubmit = [ (.hooks.UserPromptSubmit // [])[] | select(gn_entry | not) ]
-    | .hooks.Stop             = [ (.hooks.Stop             // [])[] | select(gn_entry | not) ]
-    | .hooks.SessionEnd       = [ (.hooks.SessionEnd       // [])[] | select(gn_entry | not) ]
+    | .hooks.UserPromptSubmit = [ (.hooks.UserPromptSubmit // [])[] | select(gn_owned | not) ]
+    | .hooks.Stop             = [ (.hooks.Stop             // [])[] | select(gn_owned | not) ]
+    | .hooks.SessionEnd       = [ (.hooks.SessionEnd       // [])[] | select(gn_owned | not) ]
     | .hooks.UserPromptSubmit += [{
         matcher: "",
         _managed_by: "goodnight",
@@ -2123,9 +2171,9 @@ uninstall_claude_hooks() {
   # un-uninstallable orphan.
   if ! jq "${HOOK_MATCH_JQ}"'
     .hooks = (.hooks // {})
-    | .hooks.UserPromptSubmit = [ (.hooks.UserPromptSubmit // [])[] | select(gn_entry | not) ]
-    | .hooks.Stop             = [ (.hooks.Stop             // [])[] | select(gn_entry | not) ]
-    | .hooks.SessionEnd       = [ (.hooks.SessionEnd       // [])[] | select(gn_entry | not) ]
+    | .hooks.UserPromptSubmit = [ (.hooks.UserPromptSubmit // [])[] | select(gn_owned | not) ]
+    | .hooks.Stop             = [ (.hooks.Stop             // [])[] | select(gn_owned | not) ]
+    | .hooks.SessionEnd       = [ (.hooks.SessionEnd       // [])[] | select(gn_owned | not) ]
     # Drop empty arrays so settings.json stays tidy.
     | if (.hooks.UserPromptSubmit | length) == 0 then del(.hooks.UserPromptSubmit) else . end
     | if (.hooks.Stop            | length) == 0 then del(.hooks.Stop)            else . end
@@ -2169,12 +2217,16 @@ uninstall_claude_hooks() {
 #   0  idle reached
 #   2  hard timeout reached (caller sleeps anyway)
 smart_watch_loop() {
-  local idle_start=0 now busy recent_write
+  local now busy recent_write activity_ts last_activity
   local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
   local tick=0 poll
   local start_ts elapsed idle_for remaining
   local last_log=0 entry_sleep_stamp
   start_ts=$(date +%s)
+  # Floor the clock at watch start: with no session logs at all there is
+  # nothing to measure quiet from, and the watch should still be able to
+  # conclude after one idle window rather than never.
+  last_activity=$start_ts
   entry_sleep_stamp="$(sleep_stamp)"
 
   while true; do
@@ -2212,22 +2264,35 @@ smart_watch_loop() {
     fi
 
     busy="$(count_busy_sessions)"
-    recent_write=false
-    # Only consult the session-log scan when the markers already say
-    # idle. When a session is known busy the scan cannot change the
-    # outcome, and it is the expensive half: it stats every transcript
-    # under every activity root, and those accumulate forever.
-    if [[ "$busy" == "0" ]] && transcript_active_within "$SMART_IDLE_SECONDS"; then
-      recent_write=true
+    # Work from the timestamp of the last observed activity rather than
+    # a boolean "was anything written recently".
+    #
+    # The boolean version stacked two full windows: it only stopped
+    # reporting activity once a log had already been quiet for
+    # SMART_IDLE_SECONDS, and the countdown then started from there — so
+    # the machine slept roughly 2×--idle after the last write, not
+    # --idle. Reading the mtime directly makes the wait mean what the
+    # flag says.
+    if [[ "$busy" != "0" ]]; then
+      last_activity=$now
+    else
+      activity_ts="$(newest_agent_activity)"
+      if [[ "$activity_ts" =~ ^[0-9]+$ ]] && ((activity_ts > last_activity)); then
+        last_activity=$activity_ts
+      fi
     fi
+    idle_for=$((now - last_activity))
+    ((idle_for < 0)) && idle_for=0
+    # Only used for the non-TTY status line, to name which of the two
+    # signals is holding things up.
+    recent_write=false
+    [[ "$busy" == "0" ]] && ((idle_for < SMART_IDLE_SECONDS)) && recent_write=true
 
-    if [[ "$busy" == "0" && "$recent_write" == false ]]; then
-      ((idle_start == 0)) && idle_start=$now
-      idle_for=$((now - idle_start))
+    if [[ "$busy" == "0" ]]; then
       if ((idle_for >= SMART_IDLE_SECONDS)); then
         clear_line
-        print_ok "All agents idle for $(elapsed_label "$SMART_IDLE_SECONDS") — proceeding to sleep."
-        log_event "SMART_IDLE_REACHED waited=${elapsed}s"
+        print_ok "All agents idle for $(elapsed_label "$idle_for") — proceeding to sleep."
+        log_event "SMART_IDLE_REACHED waited=${elapsed}s idle_for=${idle_for}s"
         return 0
       fi
       remaining=$((SMART_IDLE_SECONDS - idle_for))
@@ -2251,7 +2316,6 @@ smart_watch_loop() {
         poll=5
       fi
     else
-      idle_start=0
       if [[ "$USE_SPINNER" == true ]]; then
         local why
         if [[ "$busy" != "0" ]]; then
@@ -2613,10 +2677,10 @@ if [[ "$DOCTOR_MODE" == true ]]; then
   dr_health="$(hooks_health)"
   case "$dr_health" in
     ok)
-      print_ok "Hooks healthy — UserPromptSubmit and Stop both present."
+      print_ok "Hooks healthy — UserPromptSubmit, Stop and SessionEnd all present."
       ;;
     partial)
-      print_error "Hooks PARTIAL — only one of UserPromptSubmit/Stop is installed."
+      print_error "Hooks PARTIAL — UserPromptSubmit, Stop and SessionEnd are not all installed."
       print_step "Repair with: ${BOLD}goodnight --install-hooks${RESET}"
       doctor_rc=1
       ;;
@@ -2646,7 +2710,7 @@ if [[ "$DOCTOR_MODE" == true ]]; then
   fi
   if command -v jq >/dev/null 2>&1 && [[ -f "$CLAUDE_SETTINGS_FILE" ]]; then
     for dr_evt in UserPromptSubmit Stop SessionEnd; do
-      dr_n="$(jq -r "${HOOK_MATCH_JQ}"' [ (.hooks."'"$dr_evt"'" // [])[] | select(gn_entry) ] | length' \
+      dr_n="$(jq -r "${HOOK_MATCH_JQ}"' [ (.hooks."'"$dr_evt"'" // [])[] | select(gn_functional) ] | length' \
         "$CLAUDE_SETTINGS_FILE" 2>/dev/null || echo "?")"
       ui_kv "$dr_evt" "${dr_n} goodnight entr$([[ "$dr_n" == "1" ]] && echo y || echo ies)"
     done
