@@ -20,7 +20,7 @@ macOS Bash utility `sleep-after-claude` (aliased to `goodnight`) that watches a 
 - `scripts/check-parity.sh` — verifies the embedded payload matches the standalone script. See "Parity invariant" below.
 - `.githooks/pre-commit` — opt-in legacy hook that runs the parity check when either script is staged. Enable with `git config core.hooksPath .githooks`. Superseded by the `pre-commit` framework config at `.pre-commit-config.yaml`.
 - `.pre-commit-config.yaml` — canonical pre-commit config. Runs parity + `shellcheck` + `shfmt` + repo hygiene on every commit.
-- `tests/` — bats-core regression suite (218 tests). Each `*.bats` file's header comment names the audit finding(s) or subsystem it protects. Live counts: `bats tests/ --count` and `ls tests/*.bats | wc -l`.
+- `tests/` — bats-core regression suite (222 tests). Each `*.bats` file's header comment names the audit finding(s) or subsystem it protects. Live counts: `bats tests/ --count` and `ls tests/*.bats | wc -l`.
 - `README.md` — user-facing install/usage guide + documented escape hatches for CDN staleness, SHA pinning, and hook opt-out.
 
 ## Parity invariant (critical)
@@ -185,9 +185,11 @@ Design constraints, in order of importance:
 
 - **Veto only.** It can set `last_activity=$now` and nothing else. An agent blocked on a network round trip burns no CPU while genuinely working, so CPU is sound as a reason to stay awake and worthless as a reason to sleep. It must never be able to shorten a wait.
 - **Bounded.** A veto that never clears is the failure this whole cycle was about, so the hard `--timeout` still applies over the top.
-- **Above the noise floor.** Measured idle drift for live agent processes on a working machine is ~5% of one core; 20% carries roughly a 4× margin. Threshold is compared against the real elapsed interval rather than the tick, so it means the same thing at either poll rate.
+- **Debounced, because the margin is thinner than it looks.** Measured idle sits at 3–5% of one core but spikes to 14% against a 20% threshold — roughly 1.4×, not the 4× a floor-only reading suggests. And a spurious veto does not cost a tick, it resets the *whole* idle countdown, so noise arriving more often than `--idle` would hold the machine awake until the hard timeout: the never-sleeps failure this command exists to fix. `AGENT_CPU_BUSY_SAMPLES` (default 2) requires consecutive above-threshold samples. Real work is sustained by definition, so this costs one tick of detection latency against a five-minute window and buys immunity to transients. Threshold is compared against the real elapsed interval rather than the tick, so it means the same thing at either poll rate.
 - **Fails to "no veto".** Missing `pgrep`, unreadable `ps`, unparseable output — all yield 0, which delays nothing.
 - **First tick cannot veto**, since there is no previous sample to difference against.
+
+**Coverage is wider than the log signal's.** CPU needs only a process name, where the log signal must know each agent's directory layout — so `AGENT_PROCESS_NAMES` defaults to `claude codex aider gemini opencode cursor-agent` and extends via `SAC_EXTRA_AGENT_PROCESSES`. Claude and Codex have log coverage too; the rest are CPU-only, which still means a build or test run they launch keeps the Mac awake. Matched with `pgrep -x`, so a generic name cannot collide with an unrelated process.
 
 `--no-cpu-guard` / `SAC_AGENT_CPU_BUSY_PCT` are the escape hatches; the only reason to want the former is an agent process that idles hot enough to trip the threshold.
 
@@ -407,7 +409,7 @@ Fixed:
 - **Unattended by default.** Logging on, update check opt-in, every prompt time-bounded, blockers no longer abort when nobody is there to answer.
 - **`--doctor`.** The diagnostic that would have caught this from the outside on day one.
 
-Tests: 133 → 218. New files: `hook-detection-resilience.bats`, `session-activity.bats`, `verified-sleep.bats`, `doctor.bats`. Rewritten: `smart-watch-semantics.bats`, `smart-watch-runtime.bats`, `default-mode.bats`.
+Tests: 133 → 222. New files: `hook-detection-resilience.bats`, `session-activity.bats`, `verified-sleep.bats`, `doctor.bats`. Rewritten: `smart-watch-semantics.bats`, `smart-watch-runtime.bats`, `default-mode.bats`.
 
 **Deliberately broken contracts** (old tests asserted these; they were the bugs): the F-01 cold-start hold, the F-08 24-hour blind reaper, and PID-mode fallback on hook-detection failure. Each replaced by a test asserting the new contract rather than deleted.
 

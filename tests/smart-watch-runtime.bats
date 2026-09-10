@@ -30,6 +30,8 @@ setup() {
     echo 'LOG_ENABLED=false'
     echo 'CPU_GUARD=false'
     echo 'AGENT_CPU_BUSY_PCT=20'
+    echo 'AGENT_CPU_BUSY_SAMPLES=2'
+    echo 'AGENT_PROCESS_NAMES=(claude codex)'
     echo 'BOLD="" DIM="" GREEN="" YELLOW="" CYAN="" RESET=""'
     echo 'print_ok()   { echo "OK $1"; }'
     echo 'print_warn() { echo "WARN $1"; }'
@@ -260,12 +262,16 @@ JSON
   # Each sample reports 10 more CPU-seconds than the last: far above the
   # 20%-of-a-core threshold, so every tick reads as busy.
   shim ps "n=\$(cat '$ticker'); n=\$((n + 10)); echo \$n >'$ticker'; printf ' 0:%02d.00\\n' \$n"
+  # A longer idle window here so the two-sample debounce occupies the
+  # same small fraction of it that it does in production (10s of 300),
+  # rather than all of it.
   run bash -c "
     source '$BATS_TEST_TMPDIR/loop.sh'
     CPU_GUARD=true
+    SMART_IDLE_SECONDS=6
     smart_watch_loop &
     lp=\$!
-    sleep 6
+    sleep 12
     kill \$lp 2>/dev/null
     wait \$lp 2>/dev/null
     echo DONE

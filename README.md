@@ -257,7 +257,7 @@ Passing `--json` emits a machine-readable preflight report. The `scan_ok`, `can_
 
 - [x] **Smart-mode idle detection** — the default. Sleeps when every Claude session has returned to idle, not when the `claude` process exits. Works for interactive REPLs.
 - [x] **Two independent liveness signals** — hook-written busy markers *and* agent session-log activity. Both must be quiet before the Mac sleeps, so a broken hook can't cause a premature sleep and a missing hook can't prevent one.
-- [x] **Notices agents that are working silently** — a build or test run writes nothing to its session log while it runs, so goodnight also watches CPU across live `claude` and `codex` processes. It can only ever keep the Mac awake longer, never sleep it sooner.
+- [x] **Notices agents that are working silently** — a build or test run writes nothing to its session log while it runs, so goodnight also watches CPU across live `claude`, `codex`, `aider`, `gemini`, `opencode` and `cursor-agent` processes. It can only ever keep the Mac awake longer, never sleep it sooner.
 - [x] **Watches Codex too, not just Claude Code** — busy markers only describe Claude sessions, so a Claude-only watch would sleep the Mac on top of a running Codex job. Both `~/.claude/projects` and `~/.codex/sessions` are scanned; add more with `SAC_EXTRA_ACTIVITY_DIRS`.
 - [x] **Self-repairing hooks** — a damaged `~/.claude/settings.json` integration is detected and fixed in place rather than silently disabling idle detection.
 - [x] **Verified sleep** — `pmset sleepnow` reports success even when macOS refuses. goodnight confirms against the kernel and retries, and tells you when it couldn't.
@@ -408,6 +408,7 @@ goodnight needs zero configuration for normal use. These are optional knobs:
 | `SAC_SLEEP_MAX_ATTEMPTS` | No | Sleep attempts before reporting failure (default 3) | `5` |
 | `SAC_EXTRA_ACTIVITY_DIRS` | No | Extra colon-separated roots to scan for agent session logs | `~/.myagent/logs` |
 | `SAC_AGENT_CPU_BUSY_PCT` | No | Percent of one core above which an agent counts as working (default 20) | `35` |
+| `SAC_EXTRA_AGENT_PROCESSES` | No | Extra agent process names for the CPU guard (space or comma separated) | `myagent,otheragent` |
 | `SAC_NO_GUM` / `SAC_FORCE_GUM` | No | Force-off / force-on the `gum` TUI integration | `1` |
 | `SAC_NO_GLOW` | No | Force-off the `glow` markdown-rendering integration | `1` |
 
@@ -509,6 +510,16 @@ goodnight couldn't repair the hooks in `~/.claude/settings.json` — usually bec
 Note that repaired hooks only apply to Claude Code sessions started *afterwards* — a session already running has its hook config loaded.
 
 ---
+
+**Which agents does it actually watch?**
+
+| Signal | Claude Code | Codex | aider · gemini · opencode · cursor-agent | anything else |
+|---|---|---|---|---|
+| Busy markers | ✅ | — | — | — |
+| Session-log writes | ✅ | ✅ | — | — |
+| CPU activity | ✅ | ✅ | ✅ | — |
+
+Claude Code is fully covered — a long tool call holds its marker for the whole turn. The others are covered whenever they're writing or computing, which is nearly always. Add more with `SAC_EXTRA_AGENT_PROCESSES` (CPU) and `SAC_EXTRA_ACTIVITY_DIRS` (logs).
 
 **It slept while an agent was still working**
 

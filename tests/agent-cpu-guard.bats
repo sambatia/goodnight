@@ -13,6 +13,12 @@ load 'lib/common'
 setup() {
   setup_sandbox
   extract_from_script "$BATS_TEST_TMPDIR/cpu.sh" agent_cpu_centiseconds
+  # The function reads this list; under the harness's `set -u` an unset
+  # array is an error, which is the point of running with the script's
+  # own options.
+  sed -i.bak '1a\
+AGENT_PROCESS_NAMES=(claude codex)
+' "$BATS_TEST_TMPDIR/cpu.sh"
 }
 
 @test "no agent processes reports zero rather than failing" {
@@ -166,4 +172,53 @@ LOGEOF
   timeout_line="$(printf '%s\n' "$block" | grep -n 'Timeout of' | head -1 | cut -d: -f1)"
   [ -n "$sleep_line" ] && [ -n "$timeout_line" ]
   [ "$sleep_line" -lt "$timeout_line" ]
+}
+
+@test "a single CPU spike does not veto — it must be sustained" {
+  # Measured idle sits at 3-5% of a core but spikes to 14% against a 20%
+  # threshold. A lone reading must not count, because one spurious veto
+  # resets the whole idle countdown: noise arriving more often than
+  # --idle would hold the machine awake until the hard timeout, which is
+  # the never-sleeps failure this command exists to fix.
+  block="$(sed -n '/^smart_watch_loop() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")"
+  assert_contains "$block" 'cpu_hits=$((cpu_hits + 1))'
+  assert_contains "$block" 'cpu_hits=0'
+  assert_contains "$block" 'cpu_hits >= AGENT_CPU_BUSY_SAMPLES'
+  run grep -n 'AGENT_CPU_BUSY_SAMPLES=2' "$REPO_ROOT/sleep-after-claude"
+  [ "$status" -eq 0 ]
+}
+
+@test "the agent process list is configurable, not hardcoded" {
+  run grep -n 'AGENT_PROCESS_NAMES=(claude codex aider gemini opencode cursor-agent)' "$REPO_ROOT/sleep-after-claude"
+  [ "$status" -eq 0 ]
+  run grep -n 'SAC_EXTRA_AGENT_PROCESSES' "$REPO_ROOT/sleep-after-claude"
+  [ "$status" -eq 0 ]
+  # And the guard must iterate that list rather than naming binaries.
+  block="$(sed -n '/^agent_cpu_centiseconds() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")"
+  assert_contains "$block" 'for name in "${AGENT_PROCESS_NAMES[@]}"'
+  assert_not_contains "$block" 'pgrep -x claude'
+}
+
+@test "extra agent processes are picked up from the environment" {
+  extract_from_script "$BATS_TEST_TMPDIR/names.sh" agent_cpu_centiseconds
+  shim pgrep 'echo "PGREP $*" >>"$SHIM_LOG"; exit 1'
+  export SHIM_LOG="$BATS_TEST_TMPDIR/pgrep.log"
+  : >"$SHIM_LOG"
+  run bash -c "
+    AGENT_PROCESS_NAMES=(claude myagent)
+    source '$BATS_TEST_TMPDIR/names.sh'
+    agent_cpu_centiseconds"
+  [ "$output" = "0" ]
+  run cat "$SHIM_LOG"
+  assert_contains "$output" "PGREP -x claude"
+  assert_contains "$output" "PGREP -x myagent"
+}
+
+@test "caffeinate it did not start is announced as something it will kill" {
+  # "leaving as-is" told the user a caffeinate they were relying on was
+  # safe. It is captured and terminated at sleep time — it has to be,
+  # since that assertion is what blocks sleep.
+  block="$(sed -n '/^ensure_caffeinate_running() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")"
+  assert_not_contains "$block" "leaving as-is"
+  assert_contains "$block" "will release these before it sleeps"
 }
