@@ -6,8 +6,21 @@
 ![Shell](https://img.shields.io/badge/made%20with-Bash-1f425f.svg)
 ![Tests](https://img.shields.io/badge/tests-bats--core-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Last commit](https://img.shields.io/github/last-commit/sambatia/sleep-after-claude)
-![Open issues](https://img.shields.io/github/issues/sambatia/sleep-after-claude)
+![Last commit](https://img.shields.io/github/last-commit/sambatia/goodnight)
+![Open issues](https://img.shields.io/github/issues/sambatia/goodnight)
+
+
+> **Names.** The repo and the command share a name; the binary and its files do not, deliberately.
+>
+> | | |
+> |---|---|
+> | repo | `goodnight` |
+> | command you type | `goodnight` (alias) |
+> | binary / installer | `sleep-after-claude` |
+> | state, lock, hook sentinel | `~/.local/state/goodnight/`, `# goodnight-hook` |
+> | log / cache / env vars | `sleep-after-claude`, `SLEEP_AFTER_CLAUDE_*`, `SAC_*` |
+>
+> Renaming the binary would mean migrating every existing install's log, cache and environment for no functional gain, so it keeps its original name.
 
 ---
 
@@ -365,7 +378,7 @@ You do **not** need Node, Python, Homebrew, or anything else.
 Open **Terminal** (Applications → Utilities → Terminal) and paste this one command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sambatia/sleep-after-claude/main/install-sleep-after-claude.sh | bash
+curl -fsSL https://raw.githubusercontent.com/sambatia/goodnight/main/install-sleep-after-claude.sh | bash
 ```
 
 **What this does, in plain English:**
@@ -397,7 +410,7 @@ goodnight needs zero configuration for normal use. These are optional knobs:
 
 | Variable | Required? | Description | Example Value |
 |---|---|---|---|
-| `SLEEP_AFTER_CLAUDE_INSTALLER_URL` | No | Override the installer source URL (useful for pinning to a commit SHA) | `https://raw.githubusercontent.com/sambatia/sleep-after-claude/<commit-sha>/install-sleep-after-claude.sh` |
+| `SLEEP_AFTER_CLAUDE_INSTALLER_URL` | No | Override the installer source URL (useful for pinning to a commit SHA) | `https://raw.githubusercontent.com/sambatia/goodnight/<commit-sha>/install-sleep-after-claude.sh` |
 | `SLEEP_AFTER_CLAUDE_INSTALLER_SHA256` | No | Require the downloaded installer to match a specific SHA-256 | `a41a6cfe20b6d4929cff4a5db00ad0c6...` |
 | `SLEEP_AFTER_CLAUDE_UPDATE_URL` | No | Override the self-update source URL (same format as installer URL) | main-branch raw URL |
 | `SAC_JQ_SHA256` | No | Override the expected SHA-256 for the auto-installed `jq` binary (for legitimate jq re-releases) | 64-hex hash |
@@ -464,7 +477,7 @@ Your shell hasn't loaded the new alias. Either open a new terminal window, or ru
 The GitHub CDN is serving a stale cached copy of the installer (up to 5 minutes). Bust the cache:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/sambatia/sleep-after-claude/main/install-sleep-after-claude.sh?v=$(date +%s)" | bash
+curl -fsSL "https://raw.githubusercontent.com/sambatia/goodnight/main/install-sleep-after-claude.sh?v=$(date +%s)" | bash
 ```
 
 ---

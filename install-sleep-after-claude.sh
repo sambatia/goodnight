@@ -218,7 +218,7 @@ fi
 SELF="${BASH_SOURCE[0]:-$0}"
 TMP_SELF=""
 if [[ ! -f "$SELF" ]]; then
-  SOURCE_URL="${SLEEP_AFTER_CLAUDE_INSTALLER_URL:-https://raw.githubusercontent.com/sambatia/sleep-after-claude/main/install-sleep-after-claude.sh}"
+  SOURCE_URL="${SLEEP_AFTER_CLAUDE_INSTALLER_URL:-https://raw.githubusercontent.com/sambatia/goodnight/main/install-sleep-after-claude.sh}"
   # Calm single-line message (this is the normal `curl | bash` path —
   # not an error). Advanced users wanting SHA-256 provenance can find
   # the env-var recipe in the README; we don't surface it here because
@@ -864,8 +864,8 @@ PROMPT_TIMEOUT_SECS="$REPLY"
 # command can't grow it without bound.
 _cfg_int SAC_LOG_MAX_BYTES "${SAC_LOG_MAX_BYTES:-2097152}" 2097152
 LOG_MAX_BYTES="$REPLY"
-UPDATE_CHECK_URL="${SLEEP_AFTER_CLAUDE_UPDATE_URL:-https://raw.githubusercontent.com/sambatia/sleep-after-claude/main/sleep-after-claude}"
-UPDATE_INSTALLER_URL="${SLEEP_AFTER_CLAUDE_INSTALLER_URL:-https://raw.githubusercontent.com/sambatia/sleep-after-claude/main/install-sleep-after-claude.sh}"
+UPDATE_CHECK_URL="${SLEEP_AFTER_CLAUDE_UPDATE_URL:-https://raw.githubusercontent.com/sambatia/goodnight/main/sleep-after-claude}"
+UPDATE_INSTALLER_URL="${SLEEP_AFTER_CLAUDE_INSTALLER_URL:-https://raw.githubusercontent.com/sambatia/goodnight/main/install-sleep-after-claude.sh}"
 UPDATE_CACHE_DIR="${HOME}/.cache/sleep-after-claude"
 UPDATE_CACHE_TTL_SECS=86400 # 24h rate-limit on network checks
 

@@ -38,7 +38,7 @@ Out of scope:
 
 Preferred channel: use GitHub's private vulnerability reporting on this repository:
 
-> [Security advisories → Report a vulnerability](https://github.com/sambatia/sleep-after-claude/security/advisories/new)
+> [Security advisories → Report a vulnerability](https://github.com/sambatia/goodnight/security/advisories/new)
 
 Alternative: open a minimal public issue titled "Security issue — please contact me privately" (no details) and the maintainer will reach out via your GitHub profile's visible contact channels.
 
@@ -61,7 +61,7 @@ Please include, where possible:
 
 If you are particularly security-conscious:
 
-- **Pin the installer URL to a specific commit SHA** via `SLEEP_AFTER_CLAUDE_INSTALLER_URL=https://raw.githubusercontent.com/sambatia/sleep-after-claude/<sha>/install-sleep-after-claude.sh`.
+- **Pin the installer URL to a specific commit SHA** via `SLEEP_AFTER_CLAUDE_INSTALLER_URL=https://raw.githubusercontent.com/sambatia/goodnight/<sha>/install-sleep-after-claude.sh`.
 - **Pin the installer SHA-256** via `SLEEP_AFTER_CLAUDE_INSTALLER_SHA256=<hex>`. The installer refuses to proceed if the download doesn't match.
 - Treat the default `curl | bash` path as HTTPS transport trust plus shape validation. The SHA pin is what turns installer-body substitution into a hard failure.
 - **Opt out of automatic `jq` install** by pre-installing `jq` yourself (`brew install jq`); the installer detects existing `jq` and skips the download.

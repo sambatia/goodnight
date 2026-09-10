@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/sambatia/sleep-after-claude/security/advisories/new
+    url: https://github.com/sambatia/goodnight/security/advisories/new
     about: Report a security issue privately — please do NOT open a public issue.
   - name: Question / discussion
-    url: https://github.com/sambatia/sleep-after-claude/discussions
+    url: https://github.com/sambatia/goodnight/discussions
     about: For open-ended questions, usage help, or ideas that aren't yet a concrete bug or feature request.
