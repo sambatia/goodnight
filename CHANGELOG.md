@@ -5,6 +5,20 @@ Notable changes to `goodnight` (binary: `sleep-after-claude`).
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Spinner output could duplicate and strand fragments of earlier lines.**
+  Line clearing padded a fixed 72 columns with spaces, which leaves a tail
+  behind anything longer and — on a terminal narrower than 72 — wraps the
+  padding itself into a second line the next `\r` cannot reach. Clearing now
+  uses `\033[K` (erase to end of line), which is width-independent.
+- **Cancelling smart mode logged `PID unknown`.** Smart mode watches markers and
+  session logs, not a PID, so the handler reported a PID it never had for what
+  is now the default mode — and named Claude alone when the watch covers several
+  agents.
+
 ## [0.2.0] — 2026-09-10
 
 A reliability release. `goodnight` had stopped doing its job some time

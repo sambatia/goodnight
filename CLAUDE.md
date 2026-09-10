@@ -34,7 +34,7 @@ macOS Bash utility `sleep-after-claude` (aliased to `goodnight`) that watches a 
 - `scripts/check-parity.sh` — verifies the embedded payload matches the standalone script. See "Parity invariant" below.
 - `.githooks/pre-commit` — opt-in legacy hook that runs the parity check when either script is staged. Enable with `git config core.hooksPath .githooks`. Superseded by the `pre-commit` framework config at `.pre-commit-config.yaml`.
 - `.pre-commit-config.yaml` — canonical pre-commit config. Runs parity + `shellcheck` + `shfmt` + repo hygiene on every commit.
-- `tests/` — bats-core regression suite (232 tests). Each `*.bats` file's header comment names the audit finding(s) or subsystem it protects. Live counts: `bats tests/ --count` and `ls tests/*.bats | wc -l`.
+- `tests/` — bats-core regression suite (235 tests). Each `*.bats` file's header comment names the audit finding(s) or subsystem it protects. Live counts: `bats tests/ --count` and `ls tests/*.bats | wc -l`.
 - `README.md` — user-facing install/usage guide + documented escape hatches for CDN staleness, SHA pinning, and hook opt-out.
 
 ## Parity invariant (critical)
