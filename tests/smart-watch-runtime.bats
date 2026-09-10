@@ -28,6 +28,8 @@ setup() {
     echo 'USE_SPINNER=false'
     echo 'USE_BUILTIN_SLEEP=false'
     echo 'LOG_ENABLED=false'
+    echo 'CPU_GUARD=false'
+    echo 'AGENT_CPU_BUSY_PCT=20'
     echo 'BOLD="" DIM="" GREEN="" YELLOW="" CYAN="" RESET=""'
     echo 'print_ok()   { echo "OK $1"; }'
     echo 'print_warn() { echo "WARN $1"; }'
@@ -39,6 +41,7 @@ setup() {
     sed -n '/^transcript_for_session() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^transcript_active_within() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^newest_agent_activity() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
+    sed -n '/^agent_cpu_centiseconds() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^reap_dead_markers() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^count_busy_sessions() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^smart_watch_loop() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
@@ -246,4 +249,44 @@ JSON
   assert_contains "$output" "LOOP_RETURNED rc=0"
   # Generous ceiling; the doubled behaviour took >=4s plus poll slack.
   [ "$elapsed" -lt 4 ]
+}
+
+@test "an agent burning CPU holds the watch open with no marker and no writes" {
+  # The Codex case: a long tool call that writes nothing while it runs.
+  # Marker directory empty, session logs untouched — only CPU says work
+  # is happening, and that has to be enough to stay awake.
+  local ticker="$BATS_TEST_TMPDIR/cpu_ticks"
+  echo 0 >"$ticker"
+  shim pgrep 'echo 4242'
+  # Each sample reports 10 more CPU-seconds than the last: far above the
+  # 20%-of-a-core threshold, so every tick reads as busy.
+  shim ps "n=\$(cat '$ticker'); n=\$((n + 10)); echo \$n >'$ticker'; printf ' 0:%02d.00\\n' \$n"
+  run bash -c "
+    source '$BATS_TEST_TMPDIR/loop.sh'
+    CPU_GUARD=true
+    smart_watch_loop &
+    lp=\$!
+    sleep 6
+    kill \$lp 2>/dev/null
+    wait \$lp 2>/dev/null
+    echo DONE
+  "
+  assert_not_contains "$output" "All agents idle"
+  assert_contains "$output" "DONE"
+}
+
+@test "an idle agent does not hold the watch open" {
+  # Same shape, but cumulative CPU barely moves — the measured idle
+  # floor is ~5% of a core, well under the threshold. This must still
+  # sleep, or the guard would simply never let the machine rest.
+  shim pgrep 'echo 4242'
+  shim ps "printf ' 0:10.00\\n'"
+  run bash -c "
+    source '$BATS_TEST_TMPDIR/loop.sh'
+    CPU_GUARD=true
+    smart_watch_loop
+    echo \"LOOP_RETURNED rc=\$?\"
+  "
+  assert_contains "$output" "All agents idle"
+  assert_contains "$output" "LOOP_RETURNED rc=0"
 }

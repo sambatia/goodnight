@@ -20,7 +20,7 @@ macOS Bash utility `sleep-after-claude` (aliased to `goodnight`) that watches a 
 - `scripts/check-parity.sh` — verifies the embedded payload matches the standalone script. See "Parity invariant" below.
 - `.githooks/pre-commit` — opt-in legacy hook that runs the parity check when either script is staged. Enable with `git config core.hooksPath .githooks`. Superseded by the `pre-commit` framework config at `.pre-commit-config.yaml`.
 - `.pre-commit-config.yaml` — canonical pre-commit config. Runs parity + `shellcheck` + `shfmt` + repo hygiene on every commit.
-- `tests/` — bats-core regression suite (199 tests). Each `*.bats` file's header comment names the audit finding(s) or subsystem it protects. Live counts: `bats tests/ --count` and `ls tests/*.bats | wc -l`.
+- `tests/` — bats-core regression suite (213 tests). Each `*.bats` file's header comment names the audit finding(s) or subsystem it protects. Live counts: `bats tests/ --count` and `ls tests/*.bats | wc -l`.
 - `README.md` — user-facing install/usage guide + documented escape hatches for CDN staleness, SHA pinning, and hook opt-out.
 
 ## Parity invariant (critical)
@@ -169,17 +169,29 @@ Three deliberate departures from the previous behaviour, each fixing a way the m
 
 ### Cost of the two signals
 
-Marker counting is O(markers × project dirs) in `stat`s; the session-log scan is O(all transcripts) and those accumulate forever with no pruning. The scan is therefore the expensive half, and it is **skipped entirely whenever a marker already says busy** — its answer cannot change the outcome there. That confines the full traversal to the genuinely-idle case, where the loop is also polling lazily. `reap_dead_markers` uses `stat` and second arithmetic rather than `find -mmin`, which costs the same fork but makes the stale window mean exactly what it says instead of rounding to whole minutes.
+The watch draws on three signals per tick — marker count, newest session-log mtime, and agent CPU delta. Marker counting is O(markers × project dirs) in `stat`s; the session-log scan is O(all transcripts) and those accumulate forever with no pruning. The scan is therefore the expensive half, and it is **skipped entirely whenever a marker already says busy** — its answer cannot change the outcome there. That confines the full traversal to the genuinely-idle case, where the loop is also polling lazily. `reap_dead_markers` uses `stat` and second arithmetic rather than `find -mmin`, which costs the same fork but makes the stale window mean exactly what it says instead of rounding to whole minutes.
 
 Default-mode selection: **smart, unconditionally**. Falling back to `--watch-pid` on a hook-detection failure is precisely what made the outage invisible — the command kept running, just uselessly. Smart mode repairs its own hooks and degrades to transcript-only detection if it cannot, so there is no failure PID mode needs to cover. `--pid`, `--wait-for-start`, and `--watch-pid` each select PID mode explicitly; without that, the smart default would silently ignore the flag the user just passed. Early-exit modes (`--install-hooks`, `--uninstall-hooks`, `--doctor`, `--preflight`, `--list`, `--log-summary`, `--sleep-now`) bypass selection entirely.
 
 Regression tests: `tests/smart-watch-semantics.bats` (source contracts), `tests/smart-watch-runtime.bats` (drives the loop), `tests/default-mode.bats` (selection + repair).
 
-### Known limitation: silent non-Claude tool calls
+### Third signal: agent CPU
 
-An agent with no busy marker is judged purely on its session log. Claude Code sessions are safe here — a long tool call still holds a marker for the whole turn — but Codex has no marker, so a Codex tool call that runs longer than `--idle` (default 5m) without writing to its rollout log looks idle and the Mac may sleep under it.
+An agent with no busy marker is otherwise judged purely on its session log. Claude Code is safe there — a long tool call holds its marker for the whole turn — but Codex has no marker, so a Codex tool call running longer than `--idle` without writing to its rollout log would look idle.
 
-This is deliberately not papered over with a CPU-activity guard. An agent blocked on a network round trip burns no CPU while genuinely working, so CPU could only ever veto a sleep, never authorise one — and a veto that never clears is the failure this whole cycle was about. Raise `--idle` if it bites; the knob is the honest fix.
+`agent_cpu_centiseconds` closes that: it sums cumulative CPU across every live `claude` and `codex` process, and the loop compares the delta against the interval actually elapsed. Above `AGENT_CPU_BUSY_PCT` (default 20% of one core) the tick counts as activity and pins `last_activity` to now.
+
+Design constraints, in order of importance:
+
+- **Veto only.** It can set `last_activity=$now` and nothing else. An agent blocked on a network round trip burns no CPU while genuinely working, so CPU is sound as a reason to stay awake and worthless as a reason to sleep. It must never be able to shorten a wait.
+- **Bounded.** A veto that never clears is the failure this whole cycle was about, so the hard `--timeout` still applies over the top.
+- **Above the noise floor.** Measured idle drift for live agent processes on a working machine is ~5% of one core; 20% carries roughly a 4× margin. Threshold is compared against the real elapsed interval rather than the tick, so it means the same thing at either poll rate.
+- **Fails to "no veto".** Missing `pgrep`, unreadable `ps`, unparseable output — all yield 0, which delays nothing.
+- **First tick cannot veto**, since there is no previous sample to difference against.
+
+`--no-cpu-guard` / `SAC_AGENT_CPU_BUSY_PCT` are the escape hatches; the only reason to want the former is an agent process that idles hot enough to trip the threshold.
+
+**What is still not covered:** an agent that is neither writing to its log nor consuming CPU — blocked on a very long network call, say. Nothing observable distinguishes that from finished, and `--idle` is the honest knob.
 
 ## Verified sleep
 
@@ -382,7 +394,7 @@ Fixed:
 - **Unattended by default.** Logging on, update check opt-in, every prompt time-bounded, blockers no longer abort when nobody is there to answer.
 - **`--doctor`.** The diagnostic that would have caught this from the outside on day one.
 
-Tests: 133 → 199. New files: `hook-detection-resilience.bats`, `session-activity.bats`, `verified-sleep.bats`, `doctor.bats`. Rewritten: `smart-watch-semantics.bats`, `smart-watch-runtime.bats`, `default-mode.bats`.
+Tests: 133 → 213. New files: `hook-detection-resilience.bats`, `session-activity.bats`, `verified-sleep.bats`, `doctor.bats`. Rewritten: `smart-watch-semantics.bats`, `smart-watch-runtime.bats`, `default-mode.bats`.
 
 **Deliberately broken contracts** (old tests asserted these; they were the bugs): the F-01 cold-start hold, the F-08 24-hour blind reaper, and PID-mode fallback on hook-detection failure. Each replaced by a test asserting the new contract rather than deleted.
 
