@@ -1353,7 +1353,7 @@ PREFLIGHT_HIBERNATE_MODE=""
 # Flagging these as blockers creates false alarms.
 #
 # Anchored to exact daemon names (case-sensitive, full match).
-SYSTEM_DAEMONS_REGEX='^(sharingd|powerd|useractivityd|bluetoothd|rcd|coreaudiod|apsd|locationd|cloudd|searchd|mDNSResponder|UserEventAgent|symptomsd|timed|trustd|cfprefsd|WindowServer|loginwindow|SystemUIServer|Dock|Finder|ControlCenter|NotificationCenter|identityservicesd|imagent|callservicesd|remindd|parsecd|bird|iconservicesagent|iconservicesd|diskarbitrationd|fseventsd|spindump|corespeechd|corespotlightd|nsurlsessiond|nsurlstoraged|assistantd|mediaremoted|distnoted|syspolicyd|amfid|taskgated|securityd|secinitd|opendirectoryd|configd|hidd|backlightd|thermalmonitord|pboard|launchservicesd|nfcd|airportd|wifiAgent|wifiFirmwareLoader|wifianalyticsd|watchdogd|appsleepd|routined|avconferenced|bluetoothuserd|gamecontrollerd)$'
+SYSTEM_DAEMONS_REGEX='^(runningboardd|sharingd|powerd|useractivityd|bluetoothd|rcd|coreaudiod|apsd|locationd|cloudd|searchd|mDNSResponder|UserEventAgent|symptomsd|timed|trustd|cfprefsd|WindowServer|loginwindow|SystemUIServer|Dock|Finder|ControlCenter|NotificationCenter|identityservicesd|imagent|callservicesd|remindd|parsecd|bird|iconservicesagent|iconservicesd|diskarbitrationd|fseventsd|spindump|corespeechd|corespotlightd|nsurlsessiond|nsurlstoraged|assistantd|mediaremoted|distnoted|syspolicyd|amfid|taskgated|securityd|secinitd|opendirectoryd|configd|hidd|backlightd|thermalmonitord|pboard|launchservicesd|nfcd|airportd|wifiAgent|wifiFirmwareLoader|wifianalyticsd|watchdogd|appsleepd|routined|avconferenced|bluetoothuserd|gamecontrollerd)$'
 
 # Parse pmset -g assertions into categorized arrays. Used by both full
 # scan and post-watch re-scan (which only needs this).
@@ -1807,7 +1807,7 @@ print_post_watch_blockers() {
 #
 # These names include camera/audio/display daemons that commonly hold
 # PreventUserIdleSystemSleep while a video app is active.
-SYSTEM_MANAGED_BLOCKERS_REGEX='^(cameracaptured|mediaanalysisd|screencaptureui|replayd|avconferenced|WirelessRadioManagerd|kernel_task|launchd)$'
+SYSTEM_MANAGED_BLOCKERS_REGEX='^(runningboardd|powerd|useractivityd|sharingd|cameracaptured|mediaanalysisd|screencaptureui|replayd|avconferenced|WirelessRadioManagerd|kernel_task|launchd)$'
 
 # Return "system" if the blocker name is system-managed, "user" otherwise.
 classify_blocker() {
@@ -1824,6 +1824,8 @@ classify_blocker() {
 system_blocker_hint() {
   local name="$1"
   case "$name" in
+    runningboardd) echo "Routine macOS process-lifecycle assertion — released automatically at sleep time." ;;
+    powerd | useractivityd | sharingd) echo "macOS power/activity daemon — released automatically at sleep time." ;;
     cameracaptured) echo "Camera is in use — quit Zoom/Meet/FaceTime/Chrome tabs/Continuity Camera." ;;
     mediaanalysisd) echo "Photos is analyzing media — will release on its own shortly." ;;
     screencaptureui | replayd) echo "Screen recording is active — stop the recording." ;;
