@@ -53,7 +53,22 @@ Do these **before** flipping the repo to public (or immediately after). Order ma
   - [ ] Default to PR title for squash-merge commit message — **on** (cleaner history).
 - [ ] **Archives** — leave defaults.
 
-> **Two toggles are UI-only.** `secret_scanning_non_provider_patterns` and `secret_scanning_validity_checks` are both still `disabled`. The REST API accepts a PATCH for them and returns success, but the value reads back unchanged — they appear to require the web UI. Both are free on public repos and widen coverage (generic secret shapes beyond known providers; checking whether a found secret is still live), so they are worth enabling by hand at *Settings → Code security and analysis*.
+> **Two toggles are UI-only — confirmed, not assumed.** `secret_scanning_non_provider_patterns`
+> and `secret_scanning_validity_checks` are both still `disabled`. A correctly-shaped
+> `PATCH /repos/{owner}/{repo}` with those keys under `security_and_analysis` is rejected
+> outright:
+>
+> ```
+> HTTP 422 — Invalid security_and_analysis payload.
+> ```
+>
+> The looser `-f 'security_and_analysis[...][status]=enabled'` field syntax is worse: it
+> returns success and silently changes nothing, which is how this was first mis-recorded
+> as "accepted but ignored". Neither is a permissions problem — the token carries `repo`.
+>
+> Both are free on public repos and widen coverage (generic secret shapes beyond known
+> providers; checking whether a found secret is still live). Enable by hand at
+> *Settings → Code security and analysis*.
 
 ### 2b. Repo → Settings → Code security and analysis
 
