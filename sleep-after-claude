@@ -894,6 +894,22 @@ SYSTEM_DAEMONS_REGEX='^(runningboardd|sharingd|powerd|useractivityd|bluetoothd|r
 # the expected "Listed by owning process" header. Verdict rendering must
 # treat empty blockers differently when the scan failed — an unverified
 # "clear" is worse than an explicit "scan unavailable".
+# Will the release step clear this caffeinate?
+#
+# Yes unless it is alive and owned by somebody else — one owned by
+# another user survives the kill and is a genuine blocker. A process
+# that has already exited between the pmset scan and this check holds
+# nothing and blocks nothing, so it counts as clear rather than as an
+# obstacle we cannot remove. Erring the other way would let a caffeinate
+# that died mid-scan read as un-releasable.
+caffeinate_is_releasable() {
+  local pid="$1" owner
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  owner="$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')"
+  # No owner => the process is gone => nothing left to release.
+  [[ -z "$owner" || "$owner" == "$USER" ]]
+}
+
 PREFLIGHT_SCAN_OK=false
 scan_assertions() {
   local raw line parsing=false severity apid aname atype pmset_rc
@@ -930,16 +946,28 @@ scan_assertions() {
       severity="info"
       case "$atype" in
         PreventSystemSleep)
-          # Even PreventSystemSleep from system daemons is usually benign,
-          # but keep as blocker since it's the stronger assertion type.
-          if [[ "$aname" =~ $SYSTEM_DAEMONS_REGEX ]]; then
+          # caffeinate we can terminate is not a blocker, it is the thing
+          # goodnight releases. `caffeinate -dims` holds exactly this
+          # assertion (the `s`), so classifying it as un-releasable fired
+          # the red "releasing caffeinate alone will not be sufficient"
+          # panel on every run where such a caffeinate was up — while the
+          # blockers it listed *were* caffeinate. A warning that
+          # contradicts itself and fires every time is one nobody reads.
+          #
+          # Ownership matters: we can only kill our own. One owned by
+          # another user really is un-releasable and stays a blocker.
+          if [[ "$aname" == "caffeinate" ]] && caffeinate_is_releasable "$apid"; then
+            severity="release"
+          elif [[ "$aname" =~ $SYSTEM_DAEMONS_REGEX ]]; then
+            # Even PreventSystemSleep from system daemons is usually
+            # benign; the OS releases it at sleep time.
             severity="system"
           else
             severity="blocker"
           fi
           ;;
         PreventUserIdleSystemSleep)
-          if [[ "$aname" == "caffeinate" ]]; then
+          if [[ "$aname" == "caffeinate" ]] && caffeinate_is_releasable "$apid"; then
             severity="release"
           elif [[ "$aname" =~ $SYSTEM_DAEMONS_REGEX ]]; then
             severity="system"
@@ -1409,13 +1437,22 @@ prompt_and_handle_blockers() {
   fi
 
   if [[ "$UNATTENDED" == true || "$STDIN_IS_TTY" != true ]]; then
-    # Nobody is here to answer. Proceed rather than abort: the sleep
-    # itself is now verified and retried, so a blocker that survives
-    # shows up as a logged, reported failure instead of a silent
-    # refusal — and aborting here would guarantee the machine stays
-    # awake, which is the worse of the two outcomes.
-    print_warn "${#PREFLIGHT_BLOCKERS[@]} blocker(s) detected, no one to prompt — proceeding; sleep will be verified and retried."
-    log_event "BLOCKERS_UNATTENDED_PROCEED count=${#PREFLIGHT_BLOCKERS[@]}"
+    # Proceed rather than abort: the sleep itself is verified and
+    # retried, so a blocker that survives shows up as a logged, reported
+    # failure instead of a silent refusal — and aborting would guarantee
+    # the machine stays awake, the worse of the two outcomes.
+    #
+    # Say *why* we are not asking. "No one to prompt" is confusing when
+    # the user is sitting at the keyboard watching: they passed a flag
+    # that means "do not ask me", which is a different fact.
+    if [[ "$UNATTENDED" == true ]]; then
+      print_warn "${#PREFLIGHT_BLOCKERS[@]} blocker(s) detected — not asking because ${BOLD}--unattended${RESET} is set; proceeding, sleep will be verified and retried."
+      print_step "Run without ${BOLD}--unattended${RESET} to be offered the terminate/skip/abort menu."
+      log_event "BLOCKERS_UNATTENDED_PROCEED count=${#PREFLIGHT_BLOCKERS[@]} reason=flag"
+    else
+      print_warn "${#PREFLIGHT_BLOCKERS[@]} blocker(s) detected, no TTY to prompt on — proceeding; sleep will be verified and retried."
+      log_event "BLOCKERS_UNATTENDED_PROCEED count=${#PREFLIGHT_BLOCKERS[@]} reason=no-tty"
+    fi
     return 0
   fi
 

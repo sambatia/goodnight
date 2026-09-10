@@ -5,6 +5,22 @@ Notable changes to `goodnight` (binary: `sleep-after-claude`).
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Our own `caffeinate` was reported as an un-releasable sleep blocker.**
+  `caffeinate -dims` holds `PreventSystemSleep` (the `s`), and goodnight
+  terminates it before sleeping — but only `PreventUserIdleSystemSleep` from
+  caffeinate was classified as releasable. Every run with such a caffeinate up
+  therefore opened with a red *"2 active system-sleep blocker(s) — releasing
+  caffeinate alone will not be sufficient"* panel whose listed blockers **were**
+  caffeinate. A caffeinate owned by another user still counts as a real blocker,
+  since it survives the release step.
+- **The unattended blocker message said "no one to prompt"** even with the user
+  at the keyboard. It now distinguishes `--unattended` (you asked not to be
+  asked, and says how to get the menu back) from a genuinely absent TTY.
+
 ## [0.2.1] — 2026-09-10
 
 ### Fixed
