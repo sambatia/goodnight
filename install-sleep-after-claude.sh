@@ -524,7 +524,7 @@ else
   # before doing it. Users who don't want this can Ctrl+C now or
   # re-run with SAC_SKIP_HOOK_INSTALL=1.
   say "Installing Claude Code hooks into $CLAUDE_SETTINGS..."
-  say "(adds two ${C_BOLD}_managed_by: goodnight${C_RESET} entries; existing hooks preserved."
+  say "(adds three ${C_BOLD}_managed_by: goodnight${C_RESET} entries; existing hooks preserved."
   say " Skip with ${C_BOLD}SAC_SKIP_HOOK_INSTALL=1${C_RESET} and re-run; remove later with ${C_BOLD}goodnight --uninstall-hooks${C_RESET}.)"
   if ui_spin "Installing Claude Code hooks" -- bash -c '"$1" --install-hooks >"$2" 2>&1' _ "$TARGET" /tmp/sac-hook-install.log; then
     ok "Claude Code hooks installed — default mode is idle-detection."
@@ -2486,7 +2486,8 @@ HOOK_MATCH_JQ='def gn_cmds: [ (.hooks // [])[] | (.command // "") ];
 
 # Report the health of goodnight'"'"'s Claude Code hook integration.
 # Echoes exactly one word:
-#   ok       both UserPromptSubmit and Stop hooks present and usable
+#   ok       UserPromptSubmit, Stop and SessionEnd hooks all present
+#            and usable
 #   partial  one of the two present — markers would leak or never appear
 #   missing  neither present
 #   nofile   no settings.json at all
@@ -2770,7 +2771,7 @@ count_busy_sessions() {
 }
 
 # ── Claude Code hook integration ──────────────────────────────
-# These functions manage two hooks in ~/.claude/settings.json:
+# These functions manage three hooks in ~/.claude/settings.json:
 #   - UserPromptSubmit: touch $BUSY_DIR/<session_id> when user sends
 #     a new message to Claude (session is now working).
 #   - Stop: remove $BUSY_DIR/<session_id> when Claude finishes its
@@ -2780,7 +2781,7 @@ count_busy_sessions() {
 # Claude sessions are idle (no file in $BUSY_DIR) without relying on
 # the claude process to actually exit.
 
-# Install the two hooks by merging into the existing ~/.claude/settings.json.
+# Install the three hooks by merging into the existing ~/.claude/settings.json.
 # Requires jq. Preserves any other hooks the user has.
 install_claude_hooks() {
   if ! command -v jq >/dev/null 2>&1; then
