@@ -621,6 +621,7 @@ If you're looking for the command-line flags (goodnight's equivalent of an API),
 | `--stale <mins>` | `15` | Transcript silence after which a session stops counting as busy. |
 | `--unattended` | — | Never prompt; every question resolves to its safe default. |
 | `--doctor` | — | Report live health of the whole integration, then exit. Non-zero when degraded. |
+| `--version`, `-V` | — | Print the version and exit. |
 | `--no-repair` | — | Don't auto-repair degraded Claude Code hooks. |
 | `--no-cpu-guard` | — | Don't treat agent CPU activity as a reason to stay awake. |
 | `--watch-pid` | — | Legacy process-exit watching — sleep when the `claude` process dies. Use when running Claude non-interactively. |
