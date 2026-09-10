@@ -688,6 +688,18 @@ _cfg_int() {
   REPLY="$fallback"
 }
 
+# Version of this script.
+#
+# Supportability, not ceremony: a user reporting a problem has to be
+# able to say which build they are on, and the log has to record which
+# build actually slept the machine. Self-update still compares SHA-256
+# rather than this string — the hash is exact where a version can be
+# forgotten — but a hash is useless in a bug report.
+#
+# Bump in the same commit that cuts the tag; tests/version.bats asserts
+# this matches the newest CHANGELOG entry.
+SAC_VERSION="0.2.0"
+
 # ── Config defaults ───────────────────────────────────────────
 TIMEOUT_HOURS=6
 DELAY_SECS=1
@@ -1255,6 +1267,7 @@ Run `--doctor` to see all of this as live state.
 | Flag | Description |
 |---|---|
 | `--doctor` | Report live health of the whole integration, then exit. |
+| `--version, -V` | Print the version and exit. |
 | `--caffeinate-only` | Release caffeinate but don't sleep the Mac. |
 | `--dry-run` | Simulate: detect and wait, but don't sleep. |
 | `--unattended` | Never prompt; every question takes its safe default. |
@@ -3279,6 +3292,10 @@ while [[ $# -gt 0 ]]; do
       DOCTOR_MODE=true
       shift
       ;;
+    --version | -V)
+      echo "sleep-after-claude ${SAC_VERSION}"
+      exit 0
+      ;;
     --install-hooks)
       INSTALL_HOOKS=true
       shift
@@ -3437,6 +3454,8 @@ fi
 if [[ "$DOCTOR_MODE" == true ]]; then
   print_header
   doctor_rc=0
+  ui_kv "Version" "$SAC_VERSION"
+  ui_kv "Binary" "${BASH_SOURCE[0]:-$0}"
 
   ui_section "Hook integration" "Claude Code settings: $CLAUDE_SETTINGS_FILE"
   dr_health="$(hooks_health)"
@@ -3869,7 +3888,7 @@ if [[ "$SMART_WATCH" == true ]]; then
   if ! acquire_goodnight_lock; then
     exit 1
   fi
-  log_event "SMART_WATCH_START busy_count=$(count_busy_sessions) hooks=$SMART_HOOK_STATE idle=${SMART_IDLE_SECONDS}s stale=${SMART_STALE_MARKER_MINS}m timeout=${TIMEOUT_HOURS}h"
+  log_event "SMART_WATCH_START version=$SAC_VERSION busy_count=$(count_busy_sessions) hooks=$SMART_HOOK_STATE idle=${SMART_IDLE_SECONDS}s stale=${SMART_STALE_MARKER_MINS}m timeout=${TIMEOUT_HOURS}h"
   WATCH_STARTED=true
   smart_watch_loop
   SMART_WATCH_RC=$?
