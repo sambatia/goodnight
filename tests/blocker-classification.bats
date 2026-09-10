@@ -80,3 +80,46 @@ setup() {
     assert_not_contains "$output" "System-managed — quit the app"
   done
 }
+
+@test "our own caffeinate holding PreventSystemSleep is releasable, not a blocker" {
+  # `caffeinate -dims` holds exactly this assertion (the `s`), and
+  # goodnight terminates it before sleeping. Calling it un-releasable
+  # fired a red "releasing caffeinate alone will not be sufficient"
+  # panel on every run — while the blockers it listed *were* caffeinate.
+  run bash -c "
+    $(sed -n '/^caffeinate_is_releasable() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")
+    caffeinate_is_releasable \$\$ && echo YES || echo NO"
+  assert_contains "$output" "YES"
+  block="$(sed -n '/^scan_assertions() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")"
+  assert_contains "$block" 'caffeinate" ]] && caffeinate_is_releasable "$apid"'
+}
+
+@test "a live caffeinate owned by someone else stays a blocker" {
+  # PID 1 is launchd, owned by root. It survives our kill, so it is
+  # genuinely un-releasable.
+  run bash -c "
+    $(sed -n '/^caffeinate_is_releasable() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")
+    caffeinate_is_releasable 1 && echo YES || echo NO"
+  assert_contains "$output" "NO"
+}
+
+@test "a caffeinate that already exited is clear, not an obstacle" {
+  # It holds nothing and blocks nothing. Treating a process that died
+  # between the pmset scan and this check as un-releasable would invent
+  # a blocker that cannot be cleared because it is not there.
+  run bash -c "
+    $(sed -n '/^caffeinate_is_releasable() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")
+    caffeinate_is_releasable 999999 && echo YES || echo NO
+    caffeinate_is_releasable 'bogus' && echo YES || echo NO"
+  assert_not_contains "$output" "NO"
+}
+
+@test "the unattended blocker message says why it did not ask" {
+  # "No one to prompt" is confusing when the user is at the keyboard
+  # watching: they passed a flag meaning "do not ask me".
+  block="$(sed -n '/^prompt_and_handle_blockers() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")"
+  assert_contains "$block" 'not asking because'
+  assert_contains "$block" 'reason=flag'
+  assert_contains "$block" 'no TTY to prompt on'
+  assert_contains "$block" 'reason=no-tty'
+}
