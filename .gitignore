@@ -64,3 +64,9 @@ node_modules/
 # ─── Local tooling / generated artifacts ────────────────────
 .opencodeignore
 graphify-out/
+
+# Agent CLI scratch files. These were only in .git/info/exclude, which is
+# local to a single clone — a contributor running aider here would have had
+# no protection against committing their chat history.
+.aider*
+.claude/settings.local.json

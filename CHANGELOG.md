@@ -5,7 +5,7 @@ Notable changes to `goodnight` (binary: `sleep-after-claude`).
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.1] — 2026-09-10
 
 ### Fixed
 
@@ -18,6 +18,15 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   session logs, not a PID, so the handler reported a PID it never had for what
   is now the default mode — and named Claude alone when the watch covers several
   agents.
+
+### Changed
+
+- CI checks out with `actions/checkout@v7`.
+- `PUBLIC_RELEASE_CHECKLIST.md` now reflects verified live configuration rather
+  than intentions. Branch protection is enforced by a repository ruleset, which
+  is why that section had read as entirely untouched.
+- `.gitignore` covers agent CLI scratch files that were previously excluded only
+  in a single local clone.
 
 ## [0.2.0] — 2026-09-10
 
@@ -96,5 +105,6 @@ knob.
 
 First public release.
 
+[0.2.1]: https://github.com/sambatia/goodnight/releases/tag/v0.2.1
 [0.2.0]: https://github.com/sambatia/goodnight/releases/tag/v0.2.0
 [0.1.0]: https://github.com/sambatia/goodnight/releases/tag/v0.1.0
