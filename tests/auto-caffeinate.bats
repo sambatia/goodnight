@@ -7,6 +7,7 @@ setup() {
   setup_sandbox
   # Extract the function + its config.
   {
+    harness_preamble
     echo 'AUTO_STARTED_CAFFEINATE_PID=""'
     echo 'NO_AUTO_CAFFEINATE=false'
     sed -n '/^ensure_caffeinate_running() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"

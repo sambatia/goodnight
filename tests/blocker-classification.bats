@@ -53,6 +53,7 @@ setup() {
   # lifecycle bookkeeping and releases it at sleep time. Reporting it as
   # a blocker made every single run show a false alarm.
   run bash -c "
+    $(harness_preamble)
     $(sed -n '/^SYSTEM_DAEMONS_REGEX=/p' "$REPO_ROOT/sleep-after-claude")
     [[ 'runningboardd' =~ \$SYSTEM_DAEMONS_REGEX ]] && echo SYSTEM || echo BLOCKER"
   assert_contains "$output" "SYSTEM"
@@ -62,6 +63,7 @@ setup() {
   # It is root-owned and launchd-supervised: killing it would fail, and
   # macOS would respawn it anyway.
   run bash -c "
+    $(harness_preamble)
     $(sed -n '/^SYSTEM_MANAGED_BLOCKERS_REGEX=/p' "$REPO_ROOT/sleep-after-claude")
     $(sed -n '/^classify_blocker() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")
     classify_blocker runningboardd"
@@ -71,6 +73,7 @@ setup() {
 @test "system-managed blockers all carry an actionable hint" {
   for name in runningboardd powerd cameracaptured; do
     run bash -c "
+      $(harness_preamble)
       $(sed -n '/^system_blocker_hint() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")
       system_blocker_hint $name"
     [ -n "$output" ]

@@ -20,7 +20,7 @@ macOS Bash utility `sleep-after-claude` (aliased to `goodnight`) that watches a 
 - `scripts/check-parity.sh` — verifies the embedded payload matches the standalone script. See "Parity invariant" below.
 - `.githooks/pre-commit` — opt-in legacy hook that runs the parity check when either script is staged. Enable with `git config core.hooksPath .githooks`. Superseded by the `pre-commit` framework config at `.pre-commit-config.yaml`.
 - `.pre-commit-config.yaml` — canonical pre-commit config. Runs parity + `shellcheck` + `shfmt` + repo hygiene on every commit.
-- `tests/` — bats-core regression suite (222 tests). Each `*.bats` file's header comment names the audit finding(s) or subsystem it protects. Live counts: `bats tests/ --count` and `ls tests/*.bats | wc -l`.
+- `tests/` — bats-core regression suite (226 tests). Each `*.bats` file's header comment names the audit finding(s) or subsystem it protects. Live counts: `bats tests/ --count` and `ls tests/*.bats | wc -l`.
 - `README.md` — user-facing install/usage guide + documented escape hatches for CDN staleness, SHA pinning, and hook opt-out.
 
 ## Parity invariant (critical)
@@ -228,7 +228,17 @@ Every `SAC_*` integer override goes through `_cfg_int`, which falls back to the 
 - **`cmd | awk … || echo 0` under `set -o pipefail`.** awk's `END` block still prints when the upstream fails, and the failing pipeline then fires the fallback as well — two values where the contract promises one. Capture into a variable and validate at a single exit point.
 - **State assigned inside `$( )` is lost.** Anything a helper needs to accumulate for its caller must come back through `$REPLY` or a file, never a subshell.
 
-`tests/lib/common.bash` now writes `set -uo pipefail` into every extracted-function harness, because the first of these shipped precisely because the tests ran under laxer options than production.
+### Harness fidelity
+
+A harness that runs lifted production code under laxer shell options than production grades that code by rules it will never face, and blesses bugs it structurally cannot observe.
+
+`harness_preamble` in `tests/lib/common.bash` is the single statement of what production runs under; `extract_from_script` uses it, every generated harness calls it, and `tests/harness-fidelity.bats` fails the build if a harness that executes lifted code skips it.
+
+Applying it across the suite found no further production bugs but did find **two tests passing for the wrong reason**: `ui_confirm` and `check_for_update` were being exercised with variables unset that production always defines, so `[[ "$UNSET" == true ]]` was quietly false and the assertions happened to hold. Under `set -u` the under-specification is an error instead of a silent default.
+
+It also found a hand-written reimplementation of `ensure_jq`'s SHA check in `installer-jq-rejection.bats`, carrying a comment asking a human to keep it in sync — the same drift shape as a hand-kept event vocabulary. Flagged in place; lifting the real branch would be strictly better.
+
+**The guard's own first run passed vacuously.** Its `grep -qE "source .\$BATS_TEST_TMPDIR"` was double-quoted, so bash turned `\$` into a bare `$`, ERE read it as an end-anchor, and the pattern matched nothing. The check built to catch tests that pass for the wrong reason was itself passing for the wrong reason. Both directions are now verified explicitly: it fails when a preamble is removed and passes when it is restored. **A guard nobody has watched fail is not yet a guard.**
 
 ## Unattended operation
 

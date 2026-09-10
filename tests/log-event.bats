@@ -14,6 +14,7 @@ setup() {
   # companion state flags. Pulled from the real script so the test
   # fails if the implementation drifts from the contract.
   {
+    harness_preamble
     echo 'LOG_WRITE_FAILED=false'
     echo 'LOG_ROTATE_CHECKED=false'
     echo 'LOG_MAX_BYTES=2097152'

@@ -19,6 +19,7 @@ setup() {
 
 @test "terminal-ui: ui_confirm fails closed without stdin TTY" {
   {
+    harness_preamble
     sed -n '/^have_gum() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^prompt_confirm() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^ui_confirm() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
@@ -27,6 +28,10 @@ setup() {
   run bash -c "
     STDIN_IS_TTY=false
     STDOUT_IS_TTY=false
+    # Production always defines these; declaring them here keeps the
+    # harness honest about the state the function actually runs in.
+    UNATTENDED=false
+    PROMPT_TIMEOUT_SECS=60
     BOLD=''
     RESET=''
     print_warn() { echo \"WARN \$1\"; }
@@ -41,6 +46,7 @@ setup() {
 
 @test "terminal-ui: shared UI helpers render tidy plain fallback output" {
   {
+    harness_preamble
     sed -n '/^print_header() {$/,/^# Render the public CLI help/p' "$REPO_ROOT/sleep-after-claude"
   } >"$BATS_TEST_TMPDIR/ui.sh"
 

@@ -16,6 +16,10 @@ setup() {
   # it now calls (ui_spin, ui_confirm). Tests force the bash-fallback
   # path via SAC_NO_GUM=1 for deterministic output.
   {
+    harness_preamble
+    # Production's config block defines this; without it `set -u` in the
+    # preamble correctly refuses to guess.
+    echo 'SKIP_UPDATE_CHECK_FORCED=false'
     sed -n '/^UPDATE_CHECK_URL=/,/^UPDATE_CACHE_TTL_SECS=/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^have_gum() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^have_glow() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
