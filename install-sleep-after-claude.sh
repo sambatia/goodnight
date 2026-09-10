@@ -815,6 +815,41 @@ SLEEP_RETRY_BACKOFF_SECS="$REPLY"
 # bounds the veto so it can never wedge the watch.
 _cfg_int SAC_AGENT_CPU_BUSY_PCT "${SAC_AGENT_CPU_BUSY_PCT:-20}" 20
 AGENT_CPU_BUSY_PCT="$REPLY"
+
+# Process names the CPU guard treats as agents.
+#
+# The session-log signal must know where each agent writes and in what
+# shape; CPU needs only a process name, so it generalises to any agent
+# CLI for free. That makes this the cheap half of covering a new tool,
+# and the reason this list is broader than the two whose log formats
+# are actually understood.
+#
+# Claude and Codex have log coverage as well; the rest are CPU-only,
+# which still means a build or test run they launch keeps the Mac
+# awake. Extend with SAC_EXTRA_AGENT_PROCESSES (space or comma
+# separated). Matched exactly via `pgrep -x`, so a generic name cannot
+# collide with an unrelated process.
+# Consecutive above-threshold samples required before CPU counts as
+# activity.
+#
+# One sample is not enough. Measured idle on a working machine sits at
+# 3-5% of a core but spikes to 14%, and a single spurious reading does
+# not merely delay sleep by a tick — it resets the whole idle countdown.
+# Noise arriving more often than --idle would therefore hold the machine
+# awake until the hard timeout, which is precisely the never-sleeps
+# failure this command exists to fix.
+#
+# Real work is sustained by definition, so debouncing costs one tick of
+# detection latency against a 5-minute window and buys immunity to
+# transients.
+AGENT_CPU_BUSY_SAMPLES=2
+
+AGENT_PROCESS_NAMES=(claude codex aider gemini opencode cursor-agent)
+if [[ -n "${SAC_EXTRA_AGENT_PROCESSES:-}" ]]; then
+  while IFS= read -r _agent_name; do
+    [[ -n "$_agent_name" ]] && AGENT_PROCESS_NAMES+=("$_agent_name")
+  done <<<"$(printf '%s' "${SAC_EXTRA_AGENT_PROCESSES//,/ }" | tr ' ' '\n')"
+fi
 CPU_GUARD=true
 
 UNATTENDED=false
@@ -2076,7 +2111,11 @@ ensure_caffeinate_running() {
   local existing
   existing="$(pgrep -u "$USER" caffeinate 2>/dev/null || true)"
   if [[ -n "$existing" ]]; then
-    print_ok "caffeinate already running (PIDs: $(echo "$existing" | tr '\n' ' '))— leaving as-is"
+    # These get captured and terminated at sleep time — they must be,
+    # since their assertion is exactly what blocks sleep. Earlier
+    # wording here implied the opposite, telling the user a caffeinate
+    # they were relying on would be left untouched.
+    print_warn "caffeinate already running (PIDs: $(echo "$existing" | tr '\n' ' ')) — goodnight will release these before it sleeps"
     return 0
   fi
   # Start caffeinate -dim in the background, detached from this shell
@@ -2643,11 +2682,12 @@ newest_agent_activity() {
 # Echoes 0 when none are running or the figures cannot be read, so a
 # failure here degrades to "no veto" rather than to a stuck watch.
 agent_cpu_centiseconds() {
-  local pids csv
-  pids="$({
-    pgrep -x claude
-    pgrep -x codex
-  } 2>/dev/null | sort -u)"
+  local pids csv name
+  pids="$(
+    for name in "${AGENT_PROCESS_NAMES[@]}"; do
+      pgrep -x "$name" 2>/dev/null
+    done | sort -u
+  )"
   [[ -n "$pids" ]] || {
     echo 0
     return
@@ -2909,7 +2949,7 @@ uninstall_claude_hooks() {
 smart_watch_loop() {
   local now busy recent_write activity_ts last_activity
   local cpu_now cpu_delta cpu_window cpu_busy
-  local prev_cpu=-1 prev_cpu_ts=0
+  local prev_cpu=-1 prev_cpu_ts=0 cpu_hits=0
   local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
   local tick=0 poll
   local start_ts elapsed idle_for remaining
@@ -2984,6 +3024,11 @@ smart_watch_loop() {
         ((cpu_window < 1)) && cpu_window=1
         cpu_delta=$((cpu_now - prev_cpu))
         if ((cpu_delta > cpu_window * AGENT_CPU_BUSY_PCT)); then
+          cpu_hits=$((cpu_hits + 1))
+        else
+          cpu_hits=0
+        fi
+        if ((cpu_hits >= AGENT_CPU_BUSY_SAMPLES)); then
           cpu_busy=true
           last_activity=$now
         fi
@@ -3485,6 +3530,7 @@ if [[ "$DOCTOR_MODE" == true ]]; then
   dr_cpu="$(agent_cpu_centiseconds)"
   if [[ "$dr_cpu" =~ ^[0-9]+$ ]]; then
     ui_kv "Agent CPU guard" "$([[ "$CPU_GUARD" == true ]] && echo "on, busy above ${AGENT_CPU_BUSY_PCT}% of one core" || echo "off")"
+    ui_kv "Agent processes" "${AGENT_PROCESS_NAMES[*]}"
   fi
 
   ui_section "Watch configuration"

@@ -31,12 +31,17 @@ setup() {
   assert_not_contains "$output" "caffeinate already running"
 }
 
-@test "ensure_caffeinate: leaves existing caffeinate alone" {
+@test "ensure_caffeinate: does not start a second one, and says the first will be released" {
+  # It leaves a pre-existing caffeinate running for the duration of the
+  # watch, but captures and terminates it at sleep time — it has to,
+  # since that assertion is what blocks sleep. The message has to say
+  # so, or the user believes a caffeinate they rely on is untouched.
   shim pgrep 'echo 99999; exit 0' # pretend something is already running
   run bash -c "
     NO_AUTO_CAFFEINATE=false
-    BOLD='' DIM='' GREEN='' RESET=''
-    print_ok() { echo \"OK \$1\"; }
+    BOLD='' DIM='' GREEN='' YELLOW='' RESET=''
+    print_ok()   { echo \"OK \$1\"; }
+    print_warn() { echo \"WARN \$1\"; }
     log_event() { :; }
     export PATH='$SHIM_DIR:'\$PATH
     source '$BATS_TEST_TMPDIR/ensure.sh'
@@ -45,6 +50,7 @@ setup() {
   " 2>&1
   [ "$status" -eq 0 ]
   assert_contains "$output" "caffeinate already running"
+  assert_contains "$output" "will release these before it sleeps"
   assert_not_contains "$output" "Started"
 }
 
