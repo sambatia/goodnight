@@ -698,7 +698,7 @@ _cfg_int() {
 #
 # Bump in the same commit that cuts the tag; tests/version.bats asserts
 # this matches the newest CHANGELOG entry.
-SAC_VERSION="0.2.0"
+SAC_VERSION="0.2.1"
 
 # ── Config defaults ───────────────────────────────────────────
 TIMEOUT_HOURS=6
