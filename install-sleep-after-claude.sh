@@ -719,6 +719,26 @@ BUSY_DIR="${HOME}/.local/state/goodnight/busy"
 # session itself. Everything in smart mode is built on it.
 CLAUDE_PROJECTS_DIR="${SAC_CLAUDE_PROJECTS_DIR:-${HOME}/.claude/projects}"
 
+# Codex keeps the equivalent record at
+#   $CODEX_SESSIONS_DIR/YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl
+# and appends to it as the session works, exactly like Claude's
+# transcripts.
+CODEX_SESSIONS_DIR="${SAC_CODEX_SESSIONS_DIR:-${HOME}/.codex/sessions}"
+
+# Every root scanned for agent activity. Busy markers only ever describe
+# Claude Code sessions, so without this the machine would happily sleep
+# on top of a working Codex run — "wait until my agents are done" has to
+# mean all of them, not just the ones that can write us a marker.
+#
+# Extend with SAC_EXTRA_ACTIVITY_DIRS (colon-separated) for any other
+# agent that keeps an append-as-it-works log.
+AGENT_ACTIVITY_DIRS=("$CLAUDE_PROJECTS_DIR" "$CODEX_SESSIONS_DIR")
+if [[ -n "${SAC_EXTRA_ACTIVITY_DIRS:-}" ]]; then
+  while IFS= read -r _extra_dir; do
+    [[ -n "$_extra_dir" ]] && AGENT_ACTIVITY_DIRS+=("$_extra_dir")
+  done <<<"${SAC_EXTRA_ACTIVITY_DIRS//:/$'\n'}"
+fi
+
 # How long every tracked session must be quiet before we sleep.
 # Default 5 minutes: long enough that a brief gap between turns (or a
 # slow tool call that outlives its transcript write) doesn't trip the
@@ -2489,18 +2509,35 @@ transcript_for_session() {
   return 1
 }
 
-# Return 0 if ANY session transcript was written within the last N
-# seconds. One find(1), and -quit stops at the first hit, so the cost
-# does not grow with transcript-history size.
+# Return 0 if ANY agent — Claude Code, Codex, or anything added via
+# SAC_EXTRA_ACTIVITY_DIRS — wrote to its session log within the last N
+# seconds. One find(1) per root, and -quit stops at the first hit, so
+# cost does not grow with session-history size.
 transcript_active_within() {
-  local secs="$1" mins hit
-  [[ -d "$CLAUDE_PROJECTS_DIR" ]] || return 1
+  local secs="$1" mins dir hit
   # find -mmin takes minutes; round up so a sub-minute window still
   # looks at the most recent minute rather than truncating to zero.
   mins=$(((secs + 59) / 60))
   ((mins < 1)) && mins=1
-  hit="$(find "$CLAUDE_PROJECTS_DIR" -name '*.jsonl' -mmin -"$mins" -print -quit 2>/dev/null)"
-  [[ -n "$hit" ]]
+  for dir in "${AGENT_ACTIVITY_DIRS[@]}"; do
+    [[ -d "$dir" ]] || continue
+    hit="$(find "$dir" -name '*.jsonl' -mmin -"$mins" -print -quit 2>/dev/null)"
+    [[ -n "$hit" ]] && return 0
+  done
+  return 1
+}
+
+# Echo the epoch mtime of the most recently written agent session log
+# across every activity root, or nothing when there are none.
+newest_agent_activity() {
+  local dir
+  {
+    for dir in "${AGENT_ACTIVITY_DIRS[@]}"; do
+      [[ -d "$dir" ]] || continue
+      find "$dir" -name '*.jsonl' -print0 2>/dev/null |
+        xargs -0 stat -f '%m' 2>/dev/null
+    done
+  } | sort -rn | head -1
 }
 
 # Delete busy markers that no longer represent live work:
@@ -3190,14 +3227,21 @@ if [[ "$DOCTOR_MODE" == true ]]; then
   ui_kv "Stale (reaped)" "$dr_reaped"
   ui_kv "Live / working" "$dr_live"
 
-  ui_section "Agent activity" "$CLAUDE_PROJECTS_DIR"
-  if [[ ! -d "$CLAUDE_PROJECTS_DIR" ]]; then
-    print_warn "No transcripts directory — activity fallback unavailable."
+  ui_section "Agent activity" "Session logs watched for signs of work in progress"
+  dr_any_root=false
+  for dr_dir in "${AGENT_ACTIVITY_DIRS[@]}"; do
+    if [[ -d "$dr_dir" ]]; then
+      dr_any_root=true
+      ui_kv "Watching" "$dr_dir"
+    else
+      ui_kv "Absent" "$dr_dir"
+    fi
+  done
+  if [[ "$dr_any_root" != true ]]; then
+    print_warn "No agent session directories found — activity fallback unavailable."
   else
-    dr_newest="$(find "$CLAUDE_PROJECTS_DIR" -name '*.jsonl' -print0 2>/dev/null |
-      xargs -0 stat -f '%m %N' 2>/dev/null | sort -rn | head -1)"
-    if [[ -n "$dr_newest" ]]; then
-      dr_mt="${dr_newest%% *}"
+    dr_mt="$(newest_agent_activity)"
+    if [[ -n "$dr_mt" ]]; then
       dr_age=$(($(date +%s) - dr_mt))
       ui_kv "Last agent output" "$(elapsed_label "$dr_age") ago"
     else
@@ -3524,7 +3568,7 @@ if [[ "$SMART_WATCH" == true ]]; then
   print_step "Stale window:   ${BOLD}${SMART_STALE_MARKER_MINS}m${RESET} before a silent session stops counting"
   print_step "Hard timeout:   ${BOLD}${TIMEOUT_HOURS}h${RESET}"
   print_step "Busy markers:   ${BOLD}$BUSY_DIR${RESET}"
-  print_step "Transcripts:    ${BOLD}$CLAUDE_PROJECTS_DIR${RESET}"
+  print_step "Agent logs:     ${BOLD}${AGENT_ACTIVITY_DIRS[*]}${RESET}"
   [[ "$LOG_ENABLED" == true ]] && print_step "Log:            ${BOLD}${LOG_FILE}${RESET}"
   print_step "Press ${BOLD}Ctrl+C${RESET} to cancel"
   echo ""

@@ -126,12 +126,24 @@ Detection is verified against the real regression shape in `tests/hook-detection
 Two independent signals decide whether an agent is still working. Both must be quiet before the Mac sleeps.
 
 1. **Busy markers** — hook-driven, precise, instant. Only as trustworthy as the hooks.
-2. **Transcript mtime** — Claude appends to `$CLAUDE_PROJECTS_DIR/<slug>/<session_id>.jsonl` throughout a turn. Requires no cooperation, cannot be silently uninstalled, and covers sessions with no marker at all (background agents, sessions predating hook install, sessions whose hooks are broken).
+2. **Agent session-log mtime** — every agent appends to its own session log as it works. Requires no cooperation, cannot be silently uninstalled, and covers sessions with no marker at all (background agents, sessions predating hook install, sessions whose hooks are broken).
+
+   `AGENT_ACTIVITY_DIRS` lists the roots scanned, defaulting to both:
+
+   | Agent | Log path |
+   |---|---|
+   | Claude Code | `~/.claude/projects/<slug>/<session_id>.jsonl` |
+   | Codex | `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl` |
+
+   Extend with `SAC_EXTRA_ACTIVITY_DIRS` (colon-separated) for any other agent that appends to a log as it works.
+
+   **Codex support is not a nicety.** Busy markers only ever describe Claude Code sessions, so a Claude-only watch will happily sleep the Mac on top of a running Codex job. "Wait until my agents are done" has to mean all of them, not just the ones that can write us a marker.
 
 Markers decide *which* sessions to care about; transcript mtime decides whether a marked session is genuinely alive. That pairing is the point:
 
 - `transcript_for_session <sid>` resolves `$CLAUDE_PROJECTS_DIR/*/<sid>.jsonl`.
-- `transcript_active_within <secs>` is a single `find … -mmin -N -print -quit`; early exit means cost does not scale with transcript-history size.
+- `transcript_active_within <secs>` runs one `find … -mmin -N -print -quit` per root and returns on the first hit; early exit means cost does not scale with session-history size.
+- `newest_agent_activity` echoes the newest mtime across all roots (used by `--doctor`).
 - `reap_dead_markers` deletes any marker whose transcript has been silent past `SMART_STALE_MARKER_MINS` — a crash, a quit, or a session parked on a permission prompt. A marker with no transcript yet is spared until it ages out on its own mtime, so a prompt submitted a second ago is never reaped out from under a session about to start work.
 - `count_busy_sessions` reaps first, then counts what remains.
 

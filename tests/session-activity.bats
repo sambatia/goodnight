@@ -14,16 +14,19 @@ setup() {
   setup_sandbox
   export BUSY_DIR="$HOME/.local/state/goodnight/busy"
   export CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
+  export CODEX_SESSIONS_DIR="$HOME/.codex/sessions"
   export SMART_STALE_MARKER_MINS=15
-  mkdir -p "$BUSY_DIR" "$CLAUDE_PROJECTS_DIR/-Users-sam-proj"
+  mkdir -p "$BUSY_DIR" "$CLAUDE_PROJECTS_DIR/-Users-sam-proj" "$CODEX_SESSIONS_DIR/2026/09/10"
   extract_from_script "$BATS_TEST_TMPDIR/fns.sh" \
-    transcript_for_session transcript_active_within reap_dead_markers count_busy_sessions
+    transcript_for_session transcript_active_within newest_agent_activity reap_dead_markers count_busy_sessions
 }
 
 run_fn() {
   bash -c "
     BUSY_DIR='$BUSY_DIR'
     CLAUDE_PROJECTS_DIR='$CLAUDE_PROJECTS_DIR'
+    CODEX_SESSIONS_DIR='$CODEX_SESSIONS_DIR'
+    AGENT_ACTIVITY_DIRS=('$CLAUDE_PROJECTS_DIR' '$CODEX_SESSIONS_DIR')
     SMART_STALE_MARKER_MINS='$SMART_STALE_MARKER_MINS'
     source '$BATS_TEST_TMPDIR/fns.sh'
     $1"
@@ -134,4 +137,39 @@ make_session() {
 @test "empty busy dir counts zero without error" {
   run run_fn 'count_busy_sessions'
   [ "$output" = "0" ]
+}
+
+@test "a working Codex session blocks sleep even though it writes no marker" {
+  # Busy markers only ever describe Claude Code sessions. Without a
+  # second activity root the Mac would sleep on top of a running Codex
+  # job — "wait for my agents" has to mean all of them.
+  echo '{}' >"$CODEX_SESSIONS_DIR/2026/09/10/rollout-2026-09-10T03-19-47-abc.jsonl"
+  run run_fn 'transcript_active_within 300 && echo ACTIVE || echo QUIET'
+  assert_contains "$output" "ACTIVE"
+}
+
+@test "a finished Codex session stops blocking sleep" {
+  local f="$CODEX_SESSIONS_DIR/2026/09/10/rollout-old.jsonl"
+  echo '{}' >"$f"
+  touch -t "$(date -v-2H +%Y%m%d%H%M)" "$f"
+  run run_fn 'transcript_active_within 300 && echo ACTIVE || echo QUIET'
+  assert_contains "$output" "QUIET"
+}
+
+@test "activity is reported across roots, newest wins" {
+  echo '{}' >"$CLAUDE_PROJECTS_DIR/-Users-sam-proj/claude.jsonl"
+  touch -t "$(date -v-2H +%Y%m%d%H%M)" "$CLAUDE_PROJECTS_DIR/-Users-sam-proj/claude.jsonl"
+  echo '{}' >"$CODEX_SESSIONS_DIR/2026/09/10/rollout-new.jsonl"
+  run run_fn 'newest_agent_activity'
+  now=$(date +%s)
+  [ -n "$output" ]
+  # The Codex file was written just now, so the newest mtime is recent.
+  [ "$((now - output))" -lt 120 ]
+}
+
+@test "a missing Codex root is skipped, not fatal" {
+  rm -rf "$CODEX_SESSIONS_DIR"
+  echo '{}' >"$CLAUDE_PROJECTS_DIR/-Users-sam-proj/live.jsonl"
+  run run_fn 'transcript_active_within 300 && echo ACTIVE || echo QUIET'
+  assert_contains "$output" "ACTIVE"
 }

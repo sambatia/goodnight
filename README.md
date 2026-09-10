@@ -145,7 +145,7 @@ flowchart LR
 4. **Choose the watch mode.** Smart mode, always. If the Claude Code hooks are missing or damaged, goodnight repairs them; if it can't, it falls back to watching agent transcript activity directly and says so. (`--pid`, `--wait-for-start`, and `--watch-pid` select legacy process-exit watching explicitly.)
 5. **Run preflight.** Goodnight checks whether anything else on your Mac would block sleep, such as backup jobs, screen sharing, or USB devices.
 6. **Acquire the lock.** If everything is clear, goodnight acquires a mutual-exclusion lock so two concurrent `goodnight` invocations cannot race.
-7. **Wait for every agent to finish.** Goodnight watches until no session is busy *and* no agent has written any output for `--idle` (default 5 minutes), then sleeps. A session that crashed or is parked on a permission prompt stops counting after `--stale` (default 15 minutes). A hard `--timeout` (default 6h) applies regardless.
+7. **Wait for every agent to finish.** Goodnight watches until no Claude session is busy *and* no agent — Claude Code or Codex — has written any output for `--idle` (default 5 minutes), then sleeps. A session that crashed or is parked on a permission prompt stops counting after `--stale` (default 15 minutes). A hard `--timeout` (default 6h) applies regardless.
 8. **Release keep-awake helpers.** Goodnight releases any `caffeinate` helpers it started.
 9. **Start sleep.** Goodnight issues `pmset sleepnow`.
 10. **Write the log.** The full sequence is written to `~/.local/state/sleep-after-claude.log` (on by default; `--no-log` opts out, and the file rotates at 2 MB). Render it later with `goodnight --log-summary`.
@@ -166,7 +166,7 @@ flowchart LR
 | **Power gate** | macOS `pmset -g batt` | Waits for AC before spending battery on a long watch; shows a styled "plug me in" panel while waiting | Protects laptop battery without surprising the user |
 | **Sleep trigger** | macOS `pmset sleepnow` (with `osascript` fallback) | The command that actually puts the Mac to sleep | Official, supported, no flags or tricks |
 | **Self-update** | `curl` + `shasum` + `exec` | On `--check-update`, compares local ↔ remote SHA-256 and re-execs into the new binary preserving argv | Fails open; never blocks offline users |
-| **Liveness** | Claude transcript mtimes | Detects agent activity without hooks, as a safety net under the hook-driven markers | Needs no cooperation from Claude Code and can't be silently uninstalled |
+| **Liveness** | Claude + Codex session-log mtimes | Detects agent activity without hooks, as a safety net under the hook-driven markers | Needs no cooperation from the agent and can't be silently uninstalled |
 | **Sleep verification** | `sysctl kern.sleeptime` | Confirms the Mac actually slept, since `pmset sleepnow` reports success either way | The only signal that moves if and only if the machine slept |
 | **Concurrent-run lock** | `mkdir`-as-atomic-lock at `~/.local/state/goodnight/lock` | Prevents two concurrent `goodnight` invocations from racing on caffeinate release and `pmset sleepnow` | macOS bash has no `flock`; `mkdir` is atomic across processes |
 | **Shell integration** | Your `~/.zshrc` or `~/.bash_profile` | Adds the `goodnight` alias + `~/bin` on `PATH` | Standard shell practice |
@@ -256,7 +256,8 @@ Passing `--json` emits a machine-readable preflight report. The `scan_ok`, `can_
 #### 🎯 Core behavior
 
 - [x] **Smart-mode idle detection** — the default. Sleeps when every Claude session has returned to idle, not when the `claude` process exits. Works for interactive REPLs.
-- [x] **Two independent liveness signals** — hook-written busy markers *and* transcript activity. Both must be quiet before the Mac sleeps, so a broken hook can't cause a premature sleep and a missing hook can't prevent one.
+- [x] **Two independent liveness signals** — hook-written busy markers *and* agent session-log activity. Both must be quiet before the Mac sleeps, so a broken hook can't cause a premature sleep and a missing hook can't prevent one.
+- [x] **Watches Codex too, not just Claude Code** — busy markers only describe Claude sessions, so a Claude-only watch would sleep the Mac on top of a running Codex job. Both `~/.claude/projects` and `~/.codex/sessions` are scanned; add more with `SAC_EXTRA_ACTIVITY_DIRS`.
 - [x] **Self-repairing hooks** — a damaged `~/.claude/settings.json` integration is detected and fixed in place rather than silently disabling idle detection.
 - [x] **Verified sleep** — `pmset sleepnow` reports success even when macOS refuses. goodnight confirms against the kernel and retries, and tells you when it couldn't.
 - [x] **`--doctor`** — one command that reports whether the whole thing will actually work tonight. Exits non-zero when degraded, so it works as a health check.
@@ -403,6 +404,7 @@ goodnight needs zero configuration for normal use. These are optional knobs:
 | `SAC_STALE_MARKER_MINUTES` | No | Minutes of transcript silence before a session stops counting as busy (default 15) | `30` |
 | `SAC_IDLE_SECONDS` | No | Quiet period required before sleeping (default 300) | `600` |
 | `SAC_SLEEP_MAX_ATTEMPTS` | No | Sleep attempts before reporting failure (default 3) | `5` |
+| `SAC_EXTRA_ACTIVITY_DIRS` | No | Extra colon-separated roots to scan for agent session logs | `~/.myagent/logs` |
 | `SAC_NO_GUM` / `SAC_FORCE_GUM` | No | Force-off / force-on the `gum` TUI integration | `1` |
 | `SAC_NO_GLOW` | No | Force-off the `glow` markdown-rendering integration | `1` |
 

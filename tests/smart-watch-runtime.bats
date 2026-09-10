@@ -17,6 +17,7 @@ setup() {
   {
     echo 'BUSY_DIR="'"$BUSY_DIR"'"'
     echo 'CLAUDE_PROJECTS_DIR="'"$CLAUDE_PROJECTS_DIR"'"'
+    echo 'AGENT_ACTIVITY_DIRS=("'"$CLAUDE_PROJECTS_DIR"'")'
     echo 'SMART_IDLE_SECONDS=2'
     echo 'SMART_STALE_MARKER_MINS=15'
     echo 'SMART_TIMEOUT_SECS=0'
