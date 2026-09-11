@@ -439,6 +439,8 @@ Tests: 133 → 222. New files: `hook-detection-resilience.bats`, `session-activi
 
 **Deliberately broken contracts** (old tests asserted these; they were the bugs): the F-01 cold-start hold, the F-08 24-hour blind reaper, and PID-mode fallback on hook-detection failure. Each replaced by a test asserting the new contract rather than deleted.
 
+**Timing verified at the production default 2026-09-11.** An isolated run with the real `--idle 300` concluded 301s after the last session-log write — one window, not two. The earlier doubled behaviour took ~2x. Reproduce with an isolated `HOME`, one `.jsonl`, `--dry-run --no-cpu-guard`, and compare `stat -f %m` on the log against the transcript. Measure the log's mtime, not when you happen to look: an earlier attempt read 411s purely because the observer was busy elsewhere.
+
 **Verified in production 2026-09-10.** The rebuilt command was left running unattended against a machine with a live Claude session and a 4h-old Codex run. It waited 3,442s for both to go quiet, released caffeinate, and confirmed sleep against `kern.sleeptime` on the first attempt — with two sleep blockers still recorded at the moment it asked. That last detail is the point: the previous code would have reported success there regardless.
 
 **Lesson for the next cycle:** the tests were green the whole time this was broken. They asserted that `hooks_installed` returned true for a *tagged* fixture — never that it survived a fixture whose tag had been stripped by someone else. When a component's correctness depends on data another program owns, the test has to model that program misbehaving.
