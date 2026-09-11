@@ -5,33 +5,65 @@ load 'lib/common'
 
 setup() {
   setup_sandbox
-  # Extract the classifier + hint functions in isolation.
-  sed -n '/^SYSTEM_MANAGED_BLOCKERS_REGEX=/,/^}$/p' "$REPO_ROOT/sleep-after-claude" \
-    | sed -n '1,/^}$/p' > "$BATS_TEST_TMPDIR/classify.sh"
-  sed -n '/^classify_blocker() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude" >> "$BATS_TEST_TMPDIR/classify.sh"
-  sed -n '/^system_blocker_hint() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude" >> "$BATS_TEST_TMPDIR/classify.sh"
-  [ -s "$BATS_TEST_TMPDIR/classify.sh" ]
+  # Extract the classifier + its helpers in isolation, under the shell
+  # options the real script runs with.
+  harness_preamble > "$BATS_TEST_TMPDIR/classify.sh"
+  sed -n '/^SYSTEM_MANAGED_BLOCKERS_REGEX=/p' "$REPO_ROOT/sleep-after-claude" >> "$BATS_TEST_TMPDIR/classify.sh"
+  sed -n '/^LAUNCHD_SERVICE_PIDS=""$/,/^}$/p' "$REPO_ROOT/sleep-after-claude" >> "$BATS_TEST_TMPDIR/classify.sh"
+  local fn
+  for fn in launchd_manages_pid classify_blocker system_blocker_hint; do
+    sed -n "/^${fn}() {\$/,/^}\$/p" "$REPO_ROOT/sleep-after-claude" >> "$BATS_TEST_TMPDIR/classify.sh"
+  done
+  grep -q '^classify_blocker() {' "$BATS_TEST_TMPDIR/classify.sh"
+  grep -q '^cache_launchd_services() {' "$BATS_TEST_TMPDIR/classify.sh"
+  grep -q '^launchd_manages_pid() {' "$BATS_TEST_TMPDIR/classify.sh"
+
+  # A launchd inventory in the real `launchctl list` shape: a header,
+  # a registered-but-idle service, two supervised services, and a
+  # user-launched app (which carries an `application.` label).
+  # The columns are tab-separated, as launchctl really emits them — awk
+  # splits on whitespace, so a fixture using a literal backslash-t
+  # yields zero matching pids and every assertion below passes without
+  # testing anything.
+  shim launchctl "cat <<'LIST'
+PID	Status	Label
+-	0	com.apple.AddressBook.AssistantService
+1319	0	com.apple.AddressBook.SourceSync
+663	0	com.apple.sharingd
+76197	0	application.com.spotify.client.138353159.138353956
+LIST"
+}
+
+# Report every pid as owned by the current user. Scoped to the tests
+# that need it: shadowing `ps` for the whole file would also blind
+# caffeinate_is_releasable, which consults the real process table.
+shim_ps_owner_is_me() {
+  shim ps "echo '$(id -un)'"
+}
+
+classify() {
+  bash -c "source '$BATS_TEST_TMPDIR/classify.sh'; classify_blocker \"\$@\"" _ "$@"
 }
 
 @test "classify_blocker: cameracaptured is system-managed" {
-  run bash -c "source '$BATS_TEST_TMPDIR/classify.sh'; classify_blocker cameracaptured"
+  run classify cameracaptured
   [ "$status" -eq 0 ]
   [ "$output" = "system" ]
 }
 
 @test "classify_blocker: user apps like zoom are user-killable" {
-  run bash -c "source '$BATS_TEST_TMPDIR/classify.sh'; classify_blocker 'zoom.us'"
+  run classify 'zoom.us'
   [ "$output" = "user" ]
-  run bash -c "source '$BATS_TEST_TMPDIR/classify.sh'; classify_blocker Discord"
+  run classify Discord
   [ "$output" = "user" ]
-  run bash -c "source '$BATS_TEST_TMPDIR/classify.sh'; classify_blocker Slack"
+  run classify Slack
   [ "$output" = "user" ]
 }
 
 @test "classify_blocker: launchd and kernel_task are system-managed" {
-  run bash -c "source '$BATS_TEST_TMPDIR/classify.sh'; classify_blocker launchd"
+  run classify launchd
   [ "$output" = "system" ]
-  run bash -c "source '$BATS_TEST_TMPDIR/classify.sh'; classify_blocker kernel_task"
+  run classify kernel_task
   [ "$output" = "system" ]
 }
 
@@ -122,4 +154,137 @@ setup() {
   assert_contains "$block" 'reason=flag'
   assert_contains "$block" 'no TTY to prompt on'
   assert_contains "$block" 'reason=no-tty'
+}
+
+# ── Structural classification ─────────────────────────────────
+# A name list only ever knows the daemons that have already caused a
+# bad run. These tests pin the properties that make a blocker
+# un-terminable, so a daemon nobody has met yet is still classified
+# correctly the first time it holds an assertion.
+
+@test "AddressBookSourceSync is system-managed once its pid is known" {
+  # The regression: goodnight offered to terminate a launchd-supervised
+  # Contacts sync daemon under "User apps — These can be terminated by
+  # goodnight." Killing it accomplishes nothing; launchd respawns it.
+  shim_ps_owner_is_me
+  run classify AddressBookSourceSync 1319
+  [ "$status" -eq 0 ]
+  [ "$output" = "system" ]
+}
+
+@test "a launchd service is system-managed even under an unknown name" {
+  # This is the whole point of asking launchd instead of a name list.
+  shim_ps_owner_is_me
+  run classify someDaemonNobodyHasMetYet 663
+  [ "$output" = "system" ]
+}
+
+@test "a user-launched app keeps its application label and stays terminable" {
+  # launchctl lists apps too, as `application.<bundle-id>.<n>.<n>`.
+  # Treating mere launchd membership as system-managed would make every
+  # blocker un-terminable and the menu useless.
+  shim_ps_owner_is_me
+  run classify Spotify 76197
+  [ "$output" = "user" ]
+}
+
+@test "a process owned by another user is system-managed" {
+  # We cannot signal it, so offering to terminate it would be a lie.
+  shim ps "echo root"
+  run classify SomeRootDaemon 4242
+  [ "$output" = "system" ]
+}
+
+@test "a pid that has already exited falls back to the name list" {
+  # An empty owner means the process is gone. Guessing from a pid that
+  # means nothing is worse than consulting the names we do know.
+  shim ps "exit 1"
+  run classify cameracaptured 999999
+  [ "$output" = "system" ]
+  run classify Discord 999999
+  [ "$output" = "user" ]
+}
+
+@test "a non-numeric pid is ignored rather than fed to ps" {
+  run classify Discord "not-a-pid"
+  [ "$status" -eq 0 ]
+  [ "$output" = "user" ]
+}
+
+@test "launchctl being unavailable degrades to the name list, not a crash" {
+  shim_ps_owner_is_me
+  shim launchctl 'exit 127'
+  run classify Discord 76197
+  [ "$status" -eq 0 ]
+  [ "$output" = "user" ]
+  run classify cameracaptured 76197
+  [ "$output" = "system" ]
+}
+
+@test "the blocker loop passes the pid to the classifier" {
+  # classify_blocker runs inside a command substitution; the pid is
+  # what makes the structural checks possible at all. A caller that
+  # keeps passing the name alone silently reverts this fix.
+  block="$(sed -n '/^prompt_and_handle_blockers() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")"
+  assert_contains "$block" 'classify_blocker "$name" "$pid"'
+  # The launchd cache must be warmed outside the substitution: a global
+  # assigned in a subshell dies with it.
+  assert_contains "$block" 'cache_launchd_services'
+  # And invalidated first: the inventory must be newer than the scan
+  # that produced these pids.
+  assert_contains "$block" 'LAUNCHD_SERVICE_PIDS_CACHED=false'
+}
+
+@test "a launchd service gets a hint that does not send the user hunting for an app" {
+  # "quit the app that triggered this assertion" is useless advice for a
+  # background sync daemon: there is no window to close.
+  run bash -c "source '$BATS_TEST_TMPDIR/classify.sh'; system_blocker_hint AddressBookSourceSync 1319"
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "launchd"
+  assert_not_contains "$output" "quit the app"
+}
+
+@test "a system blocker with no launchd record keeps the generic hint" {
+  run bash -c "source '$BATS_TEST_TMPDIR/classify.sh'; system_blocker_hint someNeverSeenDaemon 4242"
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "quit the app"
+}
+
+@test "USER is resolved once so an unset USER cannot abort the run" {
+  # Four call sites consult it, two of them `pgrep -u`. Under `set -u`
+  # an unset USER aborts the script outright.
+  run bash -c "
+    $(harness_preamble)
+    unset USER
+    $(sed -n '/^USER=\"\${USER:-\$(id -un)}\"$/p' "$REPO_ROOT/sleep-after-claude")
+    echo \"resolved=\$USER\""
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "resolved=$(id -un)"
+}
+
+@test "the launchd inventory is rebuilt, not reused, on a second pass" {
+  # A daemon that starts after the first inventory was taken must not be
+  # classified from stale data. Observed for real: warming the cache
+  # before kickstarting AddressBookSourceSync classified it as a
+  # terminable user app.
+  cat > "$BATS_TEST_TMPDIR/drive.sh" <<DRIVE
+source '$BATS_TEST_TMPDIR/classify.sh'
+# First pass: pid 5150 is not registered yet.
+classify_blocker lateDaemon 5150
+# The daemon registers; a caller that invalidates sees it.
+printf '%s\\t0\\tcom.apple.lateDaemon\\n' 5150 >> "$BATS_TEST_TMPDIR/extra"
+LAUNCHD_SERVICE_PIDS_CACHED=false
+classify_blocker lateDaemon 5150
+DRIVE
+  : > "$BATS_TEST_TMPDIR/extra"
+  shim_ps_owner_is_me
+  shim launchctl "cat <<'LIST'
+PID	Status	Label
+663	0	com.apple.sharingd
+LIST
+cat '$BATS_TEST_TMPDIR/extra'"
+  run bash "$BATS_TEST_TMPDIR/drive.sh"
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "user" ]
+  [ "${lines[1]}" = "system" ]
 }

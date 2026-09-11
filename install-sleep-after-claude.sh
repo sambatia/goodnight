@@ -698,7 +698,12 @@ _cfg_int() {
 #
 # Bump in the same commit that cuts the tag; tests/version.bats asserts
 # this matches the newest CHANGELOG entry.
-SAC_VERSION="0.3.0"
+SAC_VERSION="0.3.1"
+
+# Four things below consult $USER: two ownership checks and two
+# `pgrep -u` calls. Under `set -u` an unset USER aborts the run
+# outright, so resolve it once here rather than at each use.
+USER="${USER:-$(id -un)}"
 
 # ── Config defaults ───────────────────────────────────────────
 TIMEOUT_HOURS=6
@@ -1961,18 +1966,65 @@ print_post_watch_blockers() {
 }
 
 # ── Blocker classification ────────────────────────────────────
-# System-managed processes (launchd-supervised Apple daemons) cannot
-# be killed by the user without sudo, and macOS respawns them anyway.
-# The user must instead quit the consumer app that triggered the
-# assertion (e.g., quit Zoom to release cameracaptured's hold).
+# A blocker belongs under "User apps" only if terminating it would
+# actually help. Two kinds of process fail that test:
 #
-# These names include camera/audio/display daemons that commonly hold
+#   1. Processes owned by another user — we cannot signal them at all.
+#   2. launchd-supervised services — macOS respawns them immediately,
+#      so killing one restarts a daemon and releases nothing.
+#
+# Both are facts the system can be asked for, which is the point: a
+# hardcoded name list only ever knows the daemons that have already
+# embarrassed us. AddressBookSourceSync was the third to be offered as
+# a terminable "user app"; there is no reason to believe it is the
+# last. `launchctl list` labels a user-launched app
+# `application.<bundle-id>.<n>.<n>` and a managed service by its plain
+# reverse-DNS label — exactly the distinction needed to tell "quit
+# Spotify" from "do not bother killing AddressBookSourceSync".
+#
+# The name list survives as the fallback for a pid that has already
+# exited, or that launchd does not know about. Its entries are the
+# camera/audio/display daemons that commonly hold
 # PreventUserIdleSystemSleep while a video app is active.
 SYSTEM_MANAGED_BLOCKERS_REGEX='^(runningboardd|powerd|useractivityd|sharingd|cameracaptured|mediaanalysisd|screencaptureui|replayd|avconferenced|WirelessRadioManagerd|kernel_task|launchd)$'
 
-# Return "system" if the blocker name is system-managed, "user" otherwise.
+# Space-delimited pids that launchd supervises as services, built once
+# per run. Applications are deliberately excluded: the user can quit
+# those, and they stay quit.
+LAUNCHD_SERVICE_PIDS=""
+LAUNCHD_SERVICE_PIDS_CACHED=false
+cache_launchd_services() {
+  [[ "$LAUNCHD_SERVICE_PIDS_CACHED" == true ]] && return 0
+  LAUNCHD_SERVICE_PIDS_CACHED=true
+  # Columns are PID, Status, Label; a dash in column 1 means the
+  # service is registered but not currently running.
+  LAUNCHD_SERVICE_PIDS=" $(launchctl list 2>/dev/null |
+    awk '$1 ~ /^[0-9]+$/ && $3 !~ /^application\./ { print $1 }' |
+    tr '\n' ' ')"
+  return 0
+}
+
+launchd_manages_pid() {
+  cache_launchd_services
+  [[ "$LAUNCHD_SERVICE_PIDS" == *" $1 "* ]]
+}
+
+# Return "system" if terminating this blocker would not release its
+# assertion, "user" otherwise. The pid is optional so that callers with
+# only a name (and the tests) still get the name-list answer.
 classify_blocker() {
-  local name="$1"
+  local name="$1" pid="${2:-}" owner
+  if [[ "$pid" =~ ^[0-9]+$ ]]; then
+    owner="$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')"
+    # An empty owner means the process is already gone; fall through to
+    # the name list rather than guessing from a pid that means nothing.
+    if [[ -n "$owner" ]]; then
+      if [[ "$owner" != "${USER:-}" ]] || launchd_manages_pid "$pid"; then
+        echo "system"
+        return
+      fi
+    fi
+  fi
   if [[ "$name" =~ $SYSTEM_MANAGED_BLOCKERS_REGEX ]]; then
     echo "system"
   else
@@ -1983,7 +2035,7 @@ classify_blocker() {
 # Print a suggested action for a system-managed blocker so the user
 # knows what to do instead of asking us to kill it.
 system_blocker_hint() {
-  local name="$1"
+  local name="$1" pid="${2:-}"
   case "$name" in
     runningboardd) echo "Routine macOS process-lifecycle assertion — released automatically at sleep time." ;;
     powerd | useractivityd | sharingd) echo "macOS power/activity daemon — released automatically at sleep time." ;;
@@ -1991,7 +2043,15 @@ system_blocker_hint() {
     mediaanalysisd) echo "Photos is analyzing media — will release on its own shortly." ;;
     screencaptureui | replayd) echo "Screen recording is active — stop the recording." ;;
     avconferenced) echo "A call/conference app is active — end the call." ;;
-    *) echo "System-managed — quit the app that triggered this assertion." ;;
+    *)
+      # A launchd service has no "app to quit" — saying so sends the
+      # user looking for a window that does not exist.
+      if [[ "$pid" =~ ^[0-9]+$ ]] && launchd_manages_pid "$pid"; then
+        echo "Background service managed by launchd — it releases this on its own; killing it only makes launchd restart it."
+      else
+        echo "System-managed — quit the app that triggered this assertion."
+      fi
+      ;;
   esac
 }
 
@@ -2002,9 +2062,18 @@ prompt_and_handle_blockers() {
   local entry pid name type kind
   local user_blockers=() system_blockers=()
 
+  # Warm the launchd cache here: classify_blocker runs inside a command
+  # substitution, and a global assigned in a subshell dies with it.
+  #
+  # Invalidate first. The inventory must be newer than the scan that
+  # produced these pids, and this function is reachable more than once
+  # per run — a cache that outlives one invocation would classify a
+  # freshly started daemon as a terminable app.
+  LAUNCHD_SERVICE_PIDS_CACHED=false
+  cache_launchd_services
   for entry in "${PREFLIGHT_BLOCKERS[@]}"; do
     IFS='|' read -r pid name type <<<"$entry"
-    kind="$(classify_blocker "$name")"
+    kind="$(classify_blocker "$name" "$pid")"
     if [[ "$kind" == "system" ]]; then
       system_blockers+=("$entry")
     else
@@ -2027,7 +2096,7 @@ prompt_and_handle_blockers() {
     for entry in "${system_blockers[@]}"; do
       IFS='|' read -r pid name type <<<"$entry"
       echo -e "    ${YELLOW}⚠${RESET}  ${BOLD}${name}${RESET} (PID $pid) — ${type}"
-      echo -e "       ${DIM}→ $(system_blocker_hint "$name")${RESET}"
+      echo -e "       ${DIM}→ $(system_blocker_hint "$name" "$pid")${RESET}"
     done
     echo ""
   fi

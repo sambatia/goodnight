@@ -5,6 +5,31 @@ Notable changes to `goodnight` (binary: `sleep-after-claude`).
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-09-12
+
+### Fixed
+
+- **launchd-supervised Apple daemons were offered as terminable "user apps".**
+  A live run listed `AddressBookSourceSync` — the Contacts sync daemon — under
+  *"User apps — These can be terminated by goodnight."* Killing it accomplishes
+  nothing: launchd respawns it immediately. It was the third such daemon to
+  reach that list, because classification consulted a hardcoded name list that
+  by construction only ever knows the daemons that have already caused a bad
+  run. Classification now asks the system instead: a process owned by another
+  user cannot be signalled at all, and `launchctl list` distinguishes a
+  supervised service (plain reverse-DNS label) from a user-launched application
+  (`application.<bundle-id>.<n>.<n>`), which is exactly the difference between
+  "quit Spotify" and "do not bother killing AddressBookSourceSync". The name
+  list remains as the fallback for a pid that has already exited or that
+  launchd does not know.
+- **The advice given for such a daemon sent the user looking for a window that
+  does not exist.** The fallback hint read *"quit the app that triggered this
+  assertion"*, which is right for `cameracaptured` and wrong for a background
+  sync service. A launchd-supervised blocker now says so instead.
+- **An unset `USER` would have aborted the run.** Four places consult it —
+  two ownership checks and two `pgrep -u` calls — and the script runs under
+  `set -u`. It is now resolved once, falling back to `id -un`.
+
 ## [0.3.0] — 2026-09-11
 
 ### Fixed
