@@ -231,3 +231,30 @@ classify() {
   # assigned in a subshell dies with it.
   assert_contains "$block" 'cache_launchd_services'
 }
+
+@test "a launchd service gets a hint that does not send the user hunting for an app" {
+  # "quit the app that triggered this assertion" is useless advice for a
+  # background sync daemon: there is no window to close.
+  run bash -c "source '$BATS_TEST_TMPDIR/classify.sh'; system_blocker_hint AddressBookSourceSync 1319"
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "launchd"
+  assert_not_contains "$output" "quit the app"
+}
+
+@test "a system blocker with no launchd record keeps the generic hint" {
+  run bash -c "source '$BATS_TEST_TMPDIR/classify.sh'; system_blocker_hint someNeverSeenDaemon 4242"
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "quit the app"
+}
+
+@test "USER is resolved once so an unset USER cannot abort the run" {
+  # Four call sites consult it, two of them `pgrep -u`. Under `set -u`
+  # an unset USER aborts the script outright.
+  run bash -c "
+    $(harness_preamble)
+    unset USER
+    $(sed -n '/^USER=\"\${USER:-\$(id -un)}\"$/p' "$REPO_ROOT/sleep-after-claude")
+    echo \"resolved=\$USER\""
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "resolved=$(id -un)"
+}

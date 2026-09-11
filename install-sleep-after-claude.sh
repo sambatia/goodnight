@@ -700,6 +700,11 @@ _cfg_int() {
 # this matches the newest CHANGELOG entry.
 SAC_VERSION="0.3.1"
 
+# Four things below consult $USER: two ownership checks and two
+# `pgrep -u` calls. Under `set -u` an unset USER aborts the run
+# outright, so resolve it once here rather than at each use.
+USER="${USER:-$(id -un)}"
+
 # ── Config defaults ───────────────────────────────────────────
 TIMEOUT_HOURS=6
 DELAY_SECS=1
@@ -2030,7 +2035,7 @@ classify_blocker() {
 # Print a suggested action for a system-managed blocker so the user
 # knows what to do instead of asking us to kill it.
 system_blocker_hint() {
-  local name="$1"
+  local name="$1" pid="${2:-}"
   case "$name" in
     runningboardd) echo "Routine macOS process-lifecycle assertion — released automatically at sleep time." ;;
     powerd | useractivityd | sharingd) echo "macOS power/activity daemon — released automatically at sleep time." ;;
@@ -2038,7 +2043,15 @@ system_blocker_hint() {
     mediaanalysisd) echo "Photos is analyzing media — will release on its own shortly." ;;
     screencaptureui | replayd) echo "Screen recording is active — stop the recording." ;;
     avconferenced) echo "A call/conference app is active — end the call." ;;
-    *) echo "System-managed — quit the app that triggered this assertion." ;;
+    *)
+      # A launchd service has no "app to quit" — saying so sends the
+      # user looking for a window that does not exist.
+      if [[ "$pid" =~ ^[0-9]+$ ]] && launchd_manages_pid "$pid"; then
+        echo "Background service managed by launchd — it releases this on its own; killing it only makes launchd restart it."
+      else
+        echo "System-managed — quit the app that triggered this assertion."
+      fi
+      ;;
   esac
 }
 
@@ -2077,7 +2090,7 @@ prompt_and_handle_blockers() {
     for entry in "${system_blockers[@]}"; do
       IFS='|' read -r pid name type <<<"$entry"
       echo -e "    ${YELLOW}⚠${RESET}  ${BOLD}${name}${RESET} (PID $pid) — ${type}"
-      echo -e "       ${DIM}→ $(system_blocker_hint "$name")${RESET}"
+      echo -e "       ${DIM}→ $(system_blocker_hint "$name" "$pid")${RESET}"
     done
     echo ""
   fi

@@ -22,6 +22,13 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "quit Spotify" and "do not bother killing AddressBookSourceSync". The name
   list remains as the fallback for a pid that has already exited or that
   launchd does not know.
+- **The advice given for such a daemon sent the user looking for a window that
+  does not exist.** The fallback hint read *"quit the app that triggered this
+  assertion"*, which is right for `cameracaptured` and wrong for a background
+  sync service. A launchd-supervised blocker now says so instead.
+- **An unset `USER` would have aborted the run.** Four places consult it —
+  two ownership checks and two `pgrep -u` calls — and the script runs under
+  `set -u`. It is now resolved once, falling back to `id -un`.
 
 ## [0.3.0] — 2026-09-11
 
