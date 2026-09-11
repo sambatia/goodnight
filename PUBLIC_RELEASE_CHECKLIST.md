@@ -53,22 +53,27 @@ Do these **before** flipping the repo to public (or immediately after). Order ma
   - [ ] Default to PR title for squash-merge commit message — **on** (cleaner history).
 - [ ] **Archives** — leave defaults.
 
-> **Two toggles are UI-only — confirmed, not assumed.** `secret_scanning_non_provider_patterns`
-> and `secret_scanning_validity_checks` are both still `disabled`. A correctly-shaped
-> `PATCH /repos/{owner}/{repo}` with those keys under `security_and_analysis` is rejected
-> outright:
+> **Two settings are not available for this repository at all.**
+> `secret_scanning_non_provider_patterns` and `secret_scanning_validity_checks` read as
+> `disabled` via the API and cannot be enabled — not by API, and not by hand.
+>
+> The REST API rejects a correctly-shaped `PATCH`:
 >
 > ```
 > HTTP 422 — Invalid security_and_analysis payload.
 > ```
 >
-> The looser `-f 'security_and_analysis[...][status]=enabled'` field syntax is worse: it
-> returns success and silently changes nothing, which is how this was first mis-recorded
-> as "accepted but ignored". Neither is a permissions problem — the token carries `repo`.
+> This was first recorded as "accepted but ignored" (true only of the loose
+> `-f 'security_and_analysis[...][status]=enabled'` field syntax, which silently no-ops),
+> then as "UI-only". Both were wrong. Checking the settings page directly
+> (*Settings → Advanced Security*) shows the Secret Protection section contains exactly two
+> controls — **Secret Protection** and **Push protection** — and both are already enabled.
+> There is no non-provider-patterns or validity-checks toggle on the page.
 >
-> Both are free on public repos and widen coverage (generic secret shapes beyond known
-> providers; checking whether a found secret is still live). Enable by hand at
-> *Settings → Code security and analysis*.
+> These appear to require GitHub Advanced Security, which a personal public repository does
+> not carry. Nothing to do here; revisit only if the repo moves under an organisation with
+> GHAS. **Do not re-add this as an action item** — two prior rounds of guidance sent the
+> reader looking for a control that does not exist.
 
 ### 2b. Repo → Settings → Code security and analysis
 
