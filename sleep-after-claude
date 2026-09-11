@@ -1463,6 +1463,12 @@ prompt_and_handle_blockers() {
 
   # Warm the launchd cache here: classify_blocker runs inside a command
   # substitution, and a global assigned in a subshell dies with it.
+  #
+  # Invalidate first. The inventory must be newer than the scan that
+  # produced these pids, and this function is reachable more than once
+  # per run — a cache that outlives one invocation would classify a
+  # freshly started daemon as a terminable app.
+  LAUNCHD_SERVICE_PIDS_CACHED=false
   cache_launchd_services
   for entry in "${PREFLIGHT_BLOCKERS[@]}"; do
     IFS='|' read -r pid name type <<<"$entry"

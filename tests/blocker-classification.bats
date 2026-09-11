@@ -230,6 +230,9 @@ classify() {
   # The launchd cache must be warmed outside the substitution: a global
   # assigned in a subshell dies with it.
   assert_contains "$block" 'cache_launchd_services'
+  # And invalidated first: the inventory must be newer than the scan
+  # that produced these pids.
+  assert_contains "$block" 'LAUNCHD_SERVICE_PIDS_CACHED=false'
 }
 
 @test "a launchd service gets a hint that does not send the user hunting for an app" {
@@ -257,4 +260,31 @@ classify() {
     echo \"resolved=\$USER\""
   [ "$status" -eq 0 ]
   assert_contains "$output" "resolved=$(id -un)"
+}
+
+@test "the launchd inventory is rebuilt, not reused, on a second pass" {
+  # A daemon that starts after the first inventory was taken must not be
+  # classified from stale data. Observed for real: warming the cache
+  # before kickstarting AddressBookSourceSync classified it as a
+  # terminable user app.
+  cat > "$BATS_TEST_TMPDIR/drive.sh" <<DRIVE
+source '$BATS_TEST_TMPDIR/classify.sh'
+# First pass: pid 5150 is not registered yet.
+classify_blocker lateDaemon 5150
+# The daemon registers; a caller that invalidates sees it.
+printf '%s\\t0\\tcom.apple.lateDaemon\\n' 5150 >> "$BATS_TEST_TMPDIR/extra"
+LAUNCHD_SERVICE_PIDS_CACHED=false
+classify_blocker lateDaemon 5150
+DRIVE
+  : > "$BATS_TEST_TMPDIR/extra"
+  shim_ps_owner_is_me
+  shim launchctl "cat <<'LIST'
+PID	Status	Label
+663	0	com.apple.sharingd
+LIST
+cat '$BATS_TEST_TMPDIR/extra'"
+  run bash "$BATS_TEST_TMPDIR/drive.sh"
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "user" ]
+  [ "${lines[1]}" = "system" ]
 }
