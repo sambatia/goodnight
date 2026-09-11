@@ -5,7 +5,7 @@ Notable changes to `goodnight` (binary: `sleep-after-claude`).
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] — 2026-09-11
 
 ### Fixed
 
@@ -134,6 +134,7 @@ knob.
 
 First public release.
 
+[0.3.0]: https://github.com/sambatia/goodnight/releases/tag/v0.3.0
 [0.2.2]: https://github.com/sambatia/goodnight/releases/tag/v0.2.2
 [0.2.1]: https://github.com/sambatia/goodnight/releases/tag/v0.2.1
 [0.2.0]: https://github.com/sambatia/goodnight/releases/tag/v0.2.0
