@@ -5,6 +5,19 @@ Notable changes to `goodnight` (binary: `sleep-after-claude`).
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Background shells and monitors were invisible to the CPU guard.** An agent's
+  work is mostly done by its children — a background shell, a Monitor, a test
+  run — spawned as `zsh`/`node`/`npm`, not as `claude`. `ps -o time=` never
+  reports a child's CPU against its parent, so watching only the named agent
+  processes missed exactly the work that continues *after* a turn ends and the
+  busy marker has been cleared. The guard now walks the whole process tree.
+  Measured live: 6 watched processes became 64, with 293 CPU-seconds previously
+  outside view on a single agent.
+
 ## [0.2.2] — 2026-09-11
 
 ### Fixed

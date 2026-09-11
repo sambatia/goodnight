@@ -44,6 +44,7 @@ setup() {
     sed -n '/^transcript_for_session() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^transcript_active_within() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^newest_agent_activity() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
+    sed -n '/^agent_process_tree() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^agent_cpu_centiseconds() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^reap_dead_markers() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"
     sed -n '/^count_busy_sessions() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude"

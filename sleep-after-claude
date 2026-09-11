@@ -2139,18 +2139,47 @@ newest_agent_activity() {
 # Total CPU time consumed by every live agent process, in centiseconds.
 # Echoes 0 when none are running or the figures cannot be read, so a
 # failure here degrades to "no veto" rather than to a stuck watch.
-agent_cpu_centiseconds() {
-  local pids csv name
-  pids="$(
+# Every PID in an agent's process tree: the agent itself plus all
+# descendants.
+#
+# The work an agent does is mostly done by its children. A background
+# shell, a Monitor, a test run, a build — Claude Code and Codex spawn
+# these as child processes named `zsh`, `node`, `npm`, not `claude`.
+# `ps -o time=` reports a process's own CPU and never its children's, so
+# measuring only the named agent processes misses precisely the work
+# that keeps a machine busy after a turn has ended and the busy marker
+# has already been cleared.
+#
+# Measured on a live machine: `pgrep -x claude` found 1 process where
+# the real tree held 22, with 293 CPU-seconds outside the guard's view.
+#
+# Depth-capped so a pathological parent/child cycle cannot spin here.
+agent_process_tree() {
+  local all frontier next name depth=0
+  all="$(
     for name in "${AGENT_PROCESS_NAMES[@]}"; do
       pgrep -x "$name" 2>/dev/null
-    done | sort -u
+    done | sort -u | tr '\n' ' '
   )"
+  frontier="$all"
+  while [[ -n "${frontier// /}" ]] && ((depth < 12)); do
+    next="$(pgrep -P "$(printf '%s' "$frontier" | tr -s ' ' ',' | sed 's/^,//;s/,$//')" 2>/dev/null | tr '\n' ' ')"
+    [[ -z "${next// /}" ]] && break
+    all="$all $next"
+    frontier="$next"
+    depth=$((depth + 1))
+  done
+  printf '%s' "$all"
+}
+
+agent_cpu_centiseconds() {
+  local pids csv
+  pids="$(agent_process_tree)"
   [[ -n "$pids" ]] || {
     echo 0
     return
   }
-  csv="$(printf '%s' "$pids" | tr '\n' ',' | sed 's/,$//')"
+  csv="$(printf '%s' "$pids" | tr -s ' \n' ',' | sed 's/^,//;s/,$//')"
   # macOS renders cumulative CPU as [dd-][hh:]mm:ss.ss, so parse from
   # the right rather than assuming a field count.
   # Captured and validated at a single exit point. The obvious

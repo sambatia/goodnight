@@ -12,7 +12,7 @@ load 'lib/common'
 
 setup() {
   setup_sandbox
-  extract_from_script "$BATS_TEST_TMPDIR/cpu.sh" agent_cpu_centiseconds
+  extract_from_script "$BATS_TEST_TMPDIR/cpu.sh" agent_process_tree agent_cpu_centiseconds
   # The function reads this list; under the harness's `set -u` an unset
   # array is an error, which is the point of running with the script's
   # own options.
@@ -194,13 +194,13 @@ LOGEOF
   run grep -n 'SAC_EXTRA_AGENT_PROCESSES' "$REPO_ROOT/sleep-after-claude"
   [ "$status" -eq 0 ]
   # And the guard must iterate that list rather than naming binaries.
-  block="$(sed -n '/^agent_cpu_centiseconds() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")"
+  block="$(sed -n '/^agent_process_tree() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")"
   assert_contains "$block" 'for name in "${AGENT_PROCESS_NAMES[@]}"'
   assert_not_contains "$block" 'pgrep -x claude'
 }
 
 @test "extra agent processes are picked up from the environment" {
-  extract_from_script "$BATS_TEST_TMPDIR/names.sh" agent_cpu_centiseconds
+  extract_from_script "$BATS_TEST_TMPDIR/names.sh" agent_process_tree agent_cpu_centiseconds
   shim pgrep 'echo "PGREP $*" >>"$SHIM_LOG"; exit 1'
   export SHIM_LOG="$BATS_TEST_TMPDIR/pgrep.log"
   : >"$SHIM_LOG"
@@ -221,4 +221,61 @@ LOGEOF
   block="$(sed -n '/^ensure_caffeinate_running() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")"
   assert_not_contains "$block" "leaving as-is"
   assert_contains "$block" "will release these before it sleeps"
+}
+
+@test "the tree includes descendants, not just the named agent process" {
+  # An agent's work is mostly done by its children: background shells,
+  # Monitors, test runs, builds — spawned as zsh/node/npm, not as
+  # `claude`. ps -o time= never reports a child's CPU against its
+  # parent, so naming only the agent misses exactly the work that keeps
+  # a machine busy after a turn ends and the marker has been cleared.
+  extract_from_script "$BATS_TEST_TMPDIR/tree.sh" agent_process_tree
+  # Fake a two-level tree: roots 100, children 200 201, grandchild 300.
+  shim pgrep "
+    case \"\$*\" in
+      *'-x claude'*)  echo 100 ;;
+      *'-P 100'*)     echo 200; echo 201 ;;
+      *'-P 200,201'*) echo 300 ;;
+      *)              exit 1 ;;
+    esac"
+  run bash -c "
+    AGENT_PROCESS_NAMES=(claude)
+    source '$BATS_TEST_TMPDIR/tree.sh'
+    agent_process_tree"
+  assert_contains "$output" "100"
+  assert_contains "$output" "200"
+  assert_contains "$output" "201"
+  assert_contains "$output" "300"
+}
+
+@test "tree walking is depth-capped so a parent/child cycle cannot spin" {
+  block="$(sed -n '/^agent_process_tree() {$/,/^}$/p' "$REPO_ROOT/sleep-after-claude")"
+  assert_contains "$block" 'depth < 12'
+}
+
+@test "no agents means an empty tree and zero CPU, not an error" {
+  extract_from_script "$BATS_TEST_TMPDIR/t.sh" agent_process_tree agent_cpu_centiseconds
+  shim pgrep 'exit 1'
+  run bash -c "
+    AGENT_PROCESS_NAMES=(claude)
+    source '$BATS_TEST_TMPDIR/t.sh'
+    agent_cpu_centiseconds"
+  [ "$output" = "0" ]
+}
+
+@test "CPU is summed across the whole tree" {
+  extract_from_script "$BATS_TEST_TMPDIR/t2.sh" agent_process_tree agent_cpu_centiseconds
+  shim pgrep "
+    case \"\$*\" in
+      *'-x claude'*) echo 100 ;;
+      *'-P 100'*)    echo 200 ;;
+      *)             exit 1 ;;
+    esac"
+  # parent 0:10.00 + child 0:05.00 = 15s = 1500 centiseconds
+  shim ps 'printf "  0:10.00\n  0:05.00\n"'
+  run bash -c "
+    AGENT_PROCESS_NAMES=(claude)
+    source '$BATS_TEST_TMPDIR/t2.sh'
+    agent_cpu_centiseconds"
+  [ "$output" = "1500" ]
 }

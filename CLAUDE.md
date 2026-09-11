@@ -34,7 +34,7 @@ macOS Bash utility `sleep-after-claude` (aliased to `goodnight`) that watches a 
 - `scripts/check-parity.sh` — verifies the embedded payload matches the standalone script. See "Parity invariant" below.
 - `.githooks/pre-commit` — opt-in legacy hook that runs the parity check when either script is staged. Enable with `git config core.hooksPath .githooks`. Superseded by the `pre-commit` framework config at `.pre-commit-config.yaml`.
 - `.pre-commit-config.yaml` — canonical pre-commit config. Runs parity + `shellcheck` + `shfmt` + repo hygiene on every commit.
-- `tests/` — bats-core regression suite (239 tests). Each `*.bats` file's header comment names the audit finding(s) or subsystem it protects. Live counts: `bats tests/ --count` and `ls tests/*.bats | wc -l`.
+- `tests/` — bats-core regression suite (243 tests). Each `*.bats` file's header comment names the audit finding(s) or subsystem it protects. Live counts: `bats tests/ --count` and `ls tests/*.bats | wc -l`.
 - `README.md` — user-facing install/usage guide + documented escape hatches for CDN staleness, SHA pinning, and hook opt-out.
 
 ## Parity invariant (critical)
@@ -207,7 +207,9 @@ Design constraints, in order of importance:
 
 `--no-cpu-guard` / `SAC_AGENT_CPU_BUSY_PCT` are the escape hatches; the only reason to want the former is an agent process that idles hot enough to trip the threshold.
 
-**What is still not covered:** an agent that is neither writing to its log nor consuming CPU — blocked on a very long network call, say. Nothing observable distinguishes that from finished, and `--idle` is the honest knob.
+**The tree, not the process.** An agent's work is mostly done by its children — a background shell, a Monitor, a test run, a build, all spawned as `zsh`/`node`/`npm` rather than as `claude`. `ps -o time=` reports a process's own CPU and never its children's, so measuring only the named processes missed exactly the work that keeps a machine busy *after* a turn ends and the busy marker has already been cleared. `agent_process_tree` walks descendants (depth-capped at 12). Measured live: `pgrep -x claude` found 1 process where the real tree held 22, with 293 CPU-seconds outside the guard's view; across all agents, 6 processes became 64. Subtree idle floor measured 4–10% of one core, still comfortably under the 20% threshold with the two-sample debounce.
+
+**What is still not covered:** an agent that is neither writing to its log nor consuming CPU anywhere in its tree — a background shell blocked on a long network call, or polling with `sleep`. Nothing observable distinguishes that from finished, and `--idle` is the honest knob.
 
 ## Verified sleep
 
