@@ -270,7 +270,7 @@ Passing `--json` emits a machine-readable preflight report. The `scan_ok`, `can_
 
 - [x] **Smart-mode idle detection** — the default. Sleeps when every Claude session has returned to idle, not when the `claude` process exits. Works for interactive REPLs.
 - [x] **Two independent liveness signals** — hook-written busy markers *and* agent session-log activity. Both must be quiet before the Mac sleeps, so a broken hook can't cause a premature sleep and a missing hook can't prevent one.
-- [x] **Notices agents that are working silently** — a build or test run writes nothing to its session log while it runs, so goodnight also watches CPU across live `claude`, `codex`, `aider`, `gemini`, `opencode` and `cursor-agent` processes. It can only ever keep the Mac awake longer, never sleep it sooner.
+- [x] **Notices agents that are working silently** — a build or test run writes nothing to its session log while it runs, so goodnight also watches CPU across live `claude`, `codex`, `aider`, `gemini`, `opencode` and `cursor-agent` processes **and everything they spawn**. Background shells and monitors are children named `zsh`/`node`, not `claude`, so watching only the agent itself would miss them entirely. It can only ever keep the Mac awake longer, never sleep it sooner.
 - [x] **Watches Codex too, not just Claude Code** — busy markers only describe Claude sessions, so a Claude-only watch would sleep the Mac on top of a running Codex job. Both `~/.claude/projects` and `~/.codex/sessions` are scanned; add more with `SAC_EXTRA_ACTIVITY_DIRS`.
 - [x] **Self-repairing hooks** — a damaged `~/.claude/settings.json` integration is detected and fixed in place rather than silently disabling idle detection.
 - [x] **Verified sleep** — `pmset sleepnow` reports success even when macOS refuses. goodnight confirms against the kernel and retries, and tells you when it couldn't.
@@ -536,7 +536,7 @@ Claude Code is fully covered — a long tool call holds its marker for the whole
 
 **It slept while an agent was still working**
 
-Three signals have to agree it's idle: no busy marker, no session-log writes, and no agent burning CPU. A build or test run trips the third even when it's silent, so the usual culprit is an agent that was neither writing nor computing — blocked on a long network call, say. Nothing observable tells that apart from finished. Raise the window for long jobs:
+Three signals have to agree it's idle: no busy marker, no session-log writes, and no CPU anywhere in an agent's process tree. A build, test run, background shell or monitor trips the third even when silent, so the usual culprit is work that was neither writing nor computing — blocked on a long network call, or polling with `sleep`. Nothing observable tells that apart from finished. Raise the window for long jobs:
 
 ```bash
 goodnight --idle 1800        # half an hour of quiet required
