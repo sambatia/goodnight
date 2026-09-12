@@ -698,7 +698,7 @@ _cfg_int() {
 #
 # Bump in the same commit that cuts the tag; tests/version.bats asserts
 # this matches the newest CHANGELOG entry.
-SAC_VERSION="0.3.1"
+SAC_VERSION="0.4.0"
 
 # Four things below consult $USER: two ownership checks and two
 # `pgrep -u` calls. Under `set -u` an unset USER aborts the run
@@ -772,6 +772,12 @@ CODEX_SESSIONS_DIR="${SAC_CODEX_SESSIONS_DIR:-${HOME}/.codex/sessions}"
 #
 # Extend with SAC_EXTRA_ACTIVITY_DIRS (colon-separated) for any other
 # agent that keeps an append-as-it-works log.
+# Claude Code streams every backgrounded command to
+#   $CLAUDE_TASKS_DIR/<project-slug>/<session-id>/tasks/<task-id>.output
+# and terminates that file with "[exited with code N]" or "[killed]".
+# A file carrying neither is a command that is still running.
+CLAUDE_TASKS_DIR="${SAC_CLAUDE_TASKS_DIR:-/tmp/claude-$(id -u)}"
+
 AGENT_ACTIVITY_DIRS=("$CLAUDE_PROJECTS_DIR" "$CODEX_SESSIONS_DIR")
 if [[ -n "${SAC_EXTRA_ACTIVITY_DIRS:-}" ]]; then
   while IFS= read -r _extra_dir; do
@@ -868,6 +874,7 @@ if [[ -n "${SAC_EXTRA_AGENT_PROCESSES:-}" ]]; then
   done <<<"$(printf '%s' "${SAC_EXTRA_AGENT_PROCESSES//,/ }" | tr ' ' '\n')"
 fi
 CPU_GUARD=true
+TASK_GUARD=true
 
 UNATTENDED=false
 NO_REPAIR=false
@@ -1282,6 +1289,7 @@ Run `--doctor` to see all of this as live state.
 | `--force, -f` | Skip confirmation prompts. |
 | `--no-repair` | Don't auto-repair degraded Claude Code hooks. |
 | `--no-cpu-guard` | Don't treat agent CPU activity as a reason to stay awake. |
+| `--no-task-guard` | Don't treat running Claude background commands as a reason to stay awake. |
 | `--check-update` | Check for a newer version now (off by default). |
 | `--skip-update-check` | Accepted for compatibility; the check is already off. |
 | `--no-auto-caffeinate` | Don't auto-start `caffeinate -dim` if missing. |
@@ -1323,6 +1331,61 @@ HELP
 # with fragments of earlier output stranded beside them.
 clear_line() {
   [[ "$USE_SPINNER" == true ]] && printf "\r\033[K"
+}
+
+# Width of the terminal right now, defaulting to a conservative 80.
+#
+# Re-read every redraw rather than cached once: a herdr or tmux pane can
+# be resized mid-run, and herdr shrinks every pane when a narrow client
+# attaches, so a width captured at startup is routinely wrong by
+# bedtime.
+term_cols() {
+  local size c
+  # Ask the controlling terminal, not tput. `tput cols` is measured
+  # wrong here: this function is always called inside a command
+  # substitution, so tput's stdout is a pipe, it cannot query the
+  # window, and it returns terminfo's static default. Verified live in
+  # a 49-column pane — tput reported 80, stty reported 49. Trusting
+  # tput left the clipping below switched off exactly when it mattered.
+  # Brace-group the redirection too: when /dev/tty is unavailable (cron,
+  # CI, a pipeline) it is the shell that reports the failed redirect, not
+  # stty, so a plain `2>/dev/null` on the command leaks the error.
+  size="$({ stty size </dev/tty; } 2>/dev/null)"
+  c="${size##* }"
+  if ! [[ "$c" =~ ^[0-9]+$ ]] || ((c <= 0)); then
+    c="${COLUMNS:-80}"
+  fi
+  if ! [[ "$c" =~ ^[0-9]+$ ]] || ((c <= 0)); then
+    c=80
+  fi
+  printf '%s' "$c"
+}
+
+# Redraw a single status line, clipped so it cannot wrap.
+#
+# `\033[K` erases from the cursor to the end of the line it is on, and
+# `\r` returns to the start of that same line. Neither can reach a row
+# the cursor has already left. A line longer than the terminal wraps, so
+# every later redraw strands the row above it — which is how a
+# 21-minute wait in a 49-column phone-sized pane filled the scrollback
+# with hundreds of copies of itself. Measured: the ordinary waiting line
+# is 52 cells, and herdr's mobile layout gives panes 49.
+#
+# Clipping to one cell short of the width keeps the cursor on this row,
+# which is what makes the next `\r\033[K` able to erase it.
+print_status() {
+  local frame_colour="$1" frame="$2" body="$3"
+  local cols budget
+  cols="$(term_cols)"
+  # Two leading spaces, the frame, two more spaces, and one spare cell
+  # so writing the final character cannot advance onto the next row.
+  budget=$((cols - 6))
+  ((budget < 12)) && budget=12
+  if ((${#body} > budget)); then
+    body="${body:0:$((budget - 1))}…"
+  fi
+  printf "\r\033[K  %s%s%s  %s%s%s" \
+    "$frame_colour" "$frame" "$RESET" "$DIM" "$body" "$RESET"
 }
 
 is_integer() { [[ "$1" =~ ^[0-9]+$ ]]; }
@@ -2454,11 +2517,8 @@ wait_for_ac_power() {
     if [[ "$USE_SPINNER" == true ]]; then
       # Static format string; every dynamic value passes through %s so
       # stray `%` characters in $pct / $gauge can never corrupt it.
-      printf "\r\033[K  %s%s%s  %sWaiting for charger…%s  %ds  %s%s%s" \
-        "$CYAN" "${frames[$tick]}" "$RESET" \
-        "$DIM" "$RESET" \
-        "$elapsed" \
-        "$YELLOW" "${gauge:-on battery}" "$RESET"
+      print_status "$CYAN" "${frames[$tick]}" \
+        "Waiting for charger…  ${elapsed}s  ${gauge:-on battery}"
     else
       # Non-TTY: emit a status line every 30 seconds so callers have
       # something to watch.
@@ -2842,6 +2902,49 @@ agent_process_tree() {
   printf '%s' "$all"
 }
 
+# Count Claude background commands that are still running.
+#
+# This is the signal the other three structurally cannot provide. An
+# agent that starts a long command and ends its turn clears its busy
+# marker (the Stop hook fires), stops appending to its transcript, and
+# burns no attributable CPU — the work is in a child that comes and
+# goes faster than any sampler can see it.
+#
+# All three went quiet together on 2026-09-12 while a 519-test bats
+# suite was still running, and the countdown to sleep began with work
+# in flight. Measured at the time: the busy tree accounted for 11% of a
+# core against an idle floor of 12%, so no CPU threshold could ever
+# have separated them.
+#
+# Abandoned files are bounded by the hard timeout rather than trusted
+# forever: a session killed mid-command leaves a file with no
+# terminator, and without the cutoff one of those would hold the Mac
+# awake every night from then on.
+running_background_tasks() {
+  [[ "$TASK_GUARD" == true ]] || {
+    echo 0
+    return
+  }
+  [[ -d "$CLAUDE_TASKS_DIR" ]] || {
+    echo 0
+    return
+  }
+  local n=0 f mtime cutoff now
+  now=$(date +%s)
+  cutoff=$((now - TIMEOUT_HOURS * 3600))
+  while IFS= read -r f; do
+    [[ -f "$f" ]] || continue
+    mtime="$(stat -f %m "$f" 2>/dev/null)"
+    [[ "$mtime" =~ ^[0-9]+$ ]] || continue
+    ((mtime < cutoff)) && continue
+    # Both terminators matter. Matching only the exit marker counts
+    # every killed task as still running.
+    grep -qE '^\[(exited with code [0-9]+|killed)\]' "$f" 2>/dev/null && continue
+    n=$((n + 1))
+  done < <(find "$CLAUDE_TASKS_DIR" -path '*/tasks/*.output' -type f 2>/dev/null)
+  printf '%s\n' "$n"
+}
+
 agent_cpu_centiseconds() {
   local pids csv
   pids="$(agent_process_tree)"
@@ -3104,7 +3207,7 @@ uninstall_claude_hooks() {
 #   0  idle reached
 #   2  hard timeout reached (caller sleeps anyway)
 smart_watch_loop() {
-  local now busy recent_write activity_ts last_activity
+  local now busy recent_write activity_ts last_activity tasks
   local cpu_now cpu_delta cpu_window cpu_busy
   local prev_cpu=-1 prev_cpu_ts=0 cpu_hits=0
   local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
@@ -3148,7 +3251,7 @@ smart_watch_loop() {
     if ((SMART_TIMEOUT_SECS > 0 && elapsed >= SMART_TIMEOUT_SECS)); then
       clear_line
       print_warn "Timeout of ${TIMEOUT_HOURS}h reached — proceeding to sleep anyway."
-      log_event "SMART_TIMEOUT after=${elapsed}s busy=$(count_busy_sessions)"
+      log_event "SMART_TIMEOUT after=${elapsed}s busy=$(count_busy_sessions) tasks=$(running_background_tasks)"
       return 2
     fi
 
@@ -3162,7 +3265,12 @@ smart_watch_loop() {
     # the machine slept roughly 2×--idle after the last write, not
     # --idle. Reading the mtime directly makes the wait mean what the
     # flag says.
-    if [[ "$busy" != "0" ]]; then
+    # A running background command is work in flight even though the
+    # turn that launched it has ended. Without this the countdown starts
+    # while a test suite is still going.
+    tasks="$(running_background_tasks)"
+    [[ "$tasks" =~ ^[0-9]+$ ]] || tasks=0
+    if [[ "$busy" != "0" || "$tasks" != "0" ]]; then
       last_activity=$now
     else
       activity_ts="$(newest_agent_activity)"
@@ -3200,19 +3308,17 @@ smart_watch_loop() {
     recent_write=false
     [[ "$busy" == "0" ]] && ((idle_for < SMART_IDLE_SECONDS)) && recent_write=true
 
-    if [[ "$busy" == "0" ]]; then
+    if [[ "$busy" == "0" && "$tasks" == "0" ]]; then
       if ((idle_for >= SMART_IDLE_SECONDS)); then
         clear_line
         print_ok "All agents idle for $(elapsed_label "$idle_for") — proceeding to sleep."
-        log_event "SMART_IDLE_REACHED waited=${elapsed}s idle_for=${idle_for}s"
+        log_event "SMART_IDLE_REACHED waited=${elapsed}s idle_for=${idle_for}s tasks=0"
         return 0
       fi
       remaining=$((SMART_IDLE_SECONDS - idle_for))
       if [[ "$USE_SPINNER" == true ]]; then
-        printf "\r\033[K  %s%s%s  %sAll agents idle…%s  sleeping in %s" \
-          "$GREEN" "${frames[$tick]}" "$RESET" \
-          "$DIM" "$RESET" \
-          "$(elapsed_label "$remaining")"
+        print_status "$GREEN" "${frames[$tick]}" \
+          "All agents idle…  sleeping in $(elapsed_label "$remaining")"
       elif ((now - last_log >= 60)); then
         last_log=$now
         echo "  … all agents idle, sleeping in $(elapsed_label "$remaining")"
@@ -3232,18 +3338,18 @@ smart_watch_loop() {
         local why
         if [[ "$busy" != "0" ]]; then
           why="${busy} session(s) working"
+        elif [[ "$tasks" != "0" ]]; then
+          why="${tasks} background task(s) running"
         elif [[ "$cpu_busy" == true ]]; then
           why="an agent is busy on CPU"
         else
           why="agent output still being written"
         fi
-        printf "\r\033[K  %s%s%s  %sWaiting — %s…%s  %s elapsed" \
-          "$CYAN" "${frames[$tick]}" "$RESET" \
-          "$DIM" "$why" "$RESET" \
-          "$(elapsed_label "$elapsed")"
+        print_status "$CYAN" "${frames[$tick]}" \
+          "Waiting — ${why}…  $(elapsed_label "$elapsed") elapsed"
       elif ((now - last_log >= 300)); then
         last_log=$now
-        echo "  … still waiting (busy=$busy recent_output=$recent_write cpu_busy=$cpu_busy, $(elapsed_label "$elapsed") elapsed)"
+        echo "  … still waiting (busy=$busy tasks=$tasks recent_output=$recent_write cpu_busy=$cpu_busy, $(elapsed_label "$elapsed") elapsed)"
       fi
       # Nothing is imminent, so poll lazily. At 5s this is ~700 wakeups
       # over an eight-hour night instead of ~14,000.
@@ -3425,6 +3531,14 @@ while [[ $# -gt 0 ]]; do
       # this is an agent process that idles hot enough to trip the
       # threshold and hold the watch open.
       CPU_GUARD=false
+      shift
+      ;;
+    --no-task-guard)
+      # Stop treating running Claude background commands as activity.
+      # The guard is bounded by --timeout already, so the only reason to
+      # reach for this is a task file left unterminated by a session
+      # that died in a way the cutoff does not cover.
+      TASK_GUARD=false
       shift
       ;;
     --no-log)
@@ -3701,6 +3815,7 @@ if [[ "$DOCTOR_MODE" == true ]]; then
   dr_cpu="$(agent_cpu_centiseconds)"
   if [[ "$dr_cpu" =~ ^[0-9]+$ ]]; then
     ui_kv "Agent CPU guard" "$([[ "$CPU_GUARD" == true ]] && echo "on, busy above ${AGENT_CPU_BUSY_PCT}% of one core" || echo "off")"
+    ui_kv "Background tasks" "$([[ "$TASK_GUARD" == true ]] && echo "guard on — $(running_background_tasks) running" || echo "guard off")"
     ui_kv "Agent processes" "${AGENT_PROCESS_NAMES[*]}"
   fi
 
@@ -4039,7 +4154,7 @@ if [[ "$SMART_WATCH" == true ]]; then
   if ! acquire_goodnight_lock; then
     exit 1
   fi
-  log_event "SMART_WATCH_START version=$SAC_VERSION busy_count=$(count_busy_sessions) hooks=$SMART_HOOK_STATE idle=${SMART_IDLE_SECONDS}s stale=${SMART_STALE_MARKER_MINS}m timeout=${TIMEOUT_HOURS}h"
+  log_event "SMART_WATCH_START version=$SAC_VERSION busy_count=$(count_busy_sessions) tasks=$(running_background_tasks) hooks=$SMART_HOOK_STATE idle=${SMART_IDLE_SECONDS}s stale=${SMART_STALE_MARKER_MINS}m timeout=${TIMEOUT_HOURS}h"
   WATCH_STARTED=true
   smart_watch_loop
   SMART_WATCH_RC=$?
@@ -4279,12 +4394,8 @@ if [[ "${SMART_WATCH_DONE:-false}" != true ]]; then
     fi
 
     if [[ "$USE_SPINNER" == true ]]; then
-      # Static format; all dynamics go through %s so stray `%` can't
-      # corrupt the format string (same safety pattern as wait_for_ac_power).
-      printf "\r\033[K  %s%s%s  %sWaiting for PID %s…%s  %s elapsed" \
-        "$CYAN" "${FRAMES[$TICK]}" "$RESET" \
-        "$DIM" "$TARGET_PID" "$RESET" \
-        "$(elapsed_label "$ELAPSED")"
+      print_status "$CYAN" "${FRAMES[$TICK]}" \
+        "Waiting for PID ${TARGET_PID}…  $(elapsed_label "$ELAPSED") elapsed"
     else
       if ((ELAPSED - LAST_STATUS_LOG >= 300)); then
         echo "  … still waiting for PID $TARGET_PID ($(elapsed_label $ELAPSED) elapsed)"
