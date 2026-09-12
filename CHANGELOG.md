@@ -5,6 +5,50 @@ Notable changes to `goodnight` (binary: `sleep-after-claude`).
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-09-12
+
+### Fixed
+
+- **goodnight counted down to sleep while an agent was still working.** The one
+  thing it must never do. On 2026-09-12 an agent launched a 519-test suite in the
+  background and ended its turn to await the result; goodnight reached
+  *"All agents idle… sleeping in 4m 5s"* with the suite still running, and only a
+  manual Ctrl-C stopped it. All three existing signals had gone quiet together,
+  and each was correct by its own definition: the Stop hook fired and cleared the
+  busy marker because the *turn* ended, the transcript saw no writes for 15m24s
+  because the agent was blocked on the command, and the CPU guard saw nothing
+  because the work lived in thousands of short-lived children.
+
+  That last one cannot be tuned. Measured on the live machine: the busy process
+  tree accounted for **11%** of a core against an idle floor of **12%** — the
+  working case reads *quieter than idle*, because `ps` cannot bill a process that
+  has already exited. Sampling a process tree misses work that does not persist
+  between samples; cumulative deltas, fork detection, and instantaneous `pcpu`
+  were all measured and all miss it identically.
+
+  A fourth signal now covers the gap directly. Claude Code streams every
+  background command to `<tasks-dir>/<project>/<session>/tasks/<id>.output` and
+  terminates that file with `[exited with code N]` or `[killed]`; a file carrying
+  neither is a command still running. goodnight now treats that as work in
+  flight. Abandoned files are bounded by `--timeout`, so a session killed
+  mid-command cannot hold the Mac awake indefinitely. Disable with
+  `--no-task-guard`; point elsewhere with `SAC_CLAUDE_TASKS_DIR`.
+
+- **The waiting spinner flooded the scrollback in a narrow pane.** `\033[K` erases
+  only the row the cursor is on, so a status line longer than the terminal wraps
+  and every later redraw strands the row above it. The ordinary waiting line
+  measures 52 cells; a herdr pane in mobile layout is 49, and that shrink is
+  global — opening the session on a phone narrows the desktop's panes too. A
+  21-minute wait left hundreds of copies of itself on screen. Reproduced in real
+  terminals: 5 redraws left 5 rows at 49 columns and 1 row at 80.
+
+  All four redraw sites now go through one clipped writer. The width comes from
+  `stty size </dev/tty`, not `tput cols` — inside a command substitution tput's
+  stdout is a pipe, so it cannot query the window and returns terminfo's static
+  80. Measured in a 49-column pane: tput said 80, stty said 49, and the first
+  version of this fix was consequently switched off in exactly the case it
+  existed for.
+
 ## [0.3.1] — 2026-09-12
 
 ### Fixed

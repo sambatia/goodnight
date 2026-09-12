@@ -12,6 +12,13 @@ setup_sandbox() {
   export SHIM_DIR="$BATS_TEST_TMPDIR/shim"
   mkdir -p "$SHIM_DIR"
   export PATH="$SHIM_DIR:$PATH"
+  # Claude Code's background-task directory is machine-global, not
+  # HOME-relative, so isolating HOME alone leaves the task guard reading
+  # the real /tmp/claude-<uid> — including the task file of the very
+  # suite that is running. Every end-to-end test then waits forever on a
+  # background command that is the test run itself.
+  export SAC_CLAUDE_TASKS_DIR="$BATS_TEST_TMPDIR/claude-tasks"
+  mkdir -p "$SAC_CLAUDE_TASKS_DIR"
   # Ensure tests never pick up caller env that might leak state.
   unset SLEEP_AFTER_CLAUDE_INSTALLER_URL
   unset SLEEP_AFTER_CLAUDE_INSTALLER_SHA256
